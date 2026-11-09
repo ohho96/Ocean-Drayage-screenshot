@@ -35,6 +35,8 @@ ENV/
 screenshots/
 terminal_screenshots/
 *.png
+*.jpg
+*.jpeg
 
 # Logs
 *.log
