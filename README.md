@@ -140,6 +140,33 @@ You must give container numbers. There is no built-in test container.
 one, and wait for you to sign in and press Enter. They then run the same checks as the dashboard and print each result,
 with the screenshot path when a container was refused.
 
+## MCP server for Claude Code
+
+`mcp_server.py` lets Claude Code see the desk while helping improve it, for
+example to fix selectors when a terminal changes its site. It runs over stdio
+(no network port) and is registered in `.mcp.json`. Claude Code asks you to
+approve it the first time a session starts in this folder. Check it with
+`claude mcp list`.
+
+| Tool | What it does |
+|------|--------------|
+| `list_browsers` | Open browsers: sign-in state, address, tabs, last message |
+| `inspect_page` | The current page of one browser: address, frames, form fields, buttons, links, table previews, visible text, and a screenshot |
+| `query_selector` | Test a CSS selector in a browser (all frames) |
+| `check_containers` | Run the APM/LBCT check in a browser you've signed in to |
+| `screenshot_schedule` | Public schedule screenshot plus receiving rows read from it |
+| `classify_text` | Which finding a page with this text would get |
+| `read_browser_log` | End of `data/browsers/<terminal>.log` |
+| `desk_state` | Saved checks, receiving rows and recent evidence |
+| `saved_logins` | Which login systems have a saved login (yes/no only) |
+
+**Limits, by design:**
+- **Logins:** it can't read saved logins (only whether one exists) or anything typed in a field. Field lists say only whether a field has a value, and HTML snippets have every `value` removed.
+- **Control:** it can't sign in, type, click or navigate. You open browsers from the dashboard and sign in yourself.
+- **Containers:** `check_containers` only runs in a browser that is already signed in.
+
+Page screenshots from `inspect_page` go to `screenshots/_inspect/`.
+
 ## Files
 
 | File | Purpose |
@@ -148,6 +175,7 @@ with the screenshot path when a container was refused.
 | `screenshot.py` | Public empty-schedule screenshots (`--json` output for the dashboard) |
 | `schedules.py` | Reads public schedule tables into receiving-board rows (ITS so far) |
 | `APM.py`, `LBCT.py` | CLI wrappers around `desk_browser.run_cli` |
+| `mcp_server.py` | MCP server so Claude Code can inspect browsers and the desk (`.mcp.json`) |
 | `ssl_lookup.py` | Shipping line name ↔ SCAC code lookup |
 | `dashboard/src/model.rs` | Terminals, findings, proof packet and board text |
 | `dashboard/src/browser.rs` | Starts and talks to the Python processes |

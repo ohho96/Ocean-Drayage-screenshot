@@ -12,7 +12,9 @@ Two ways in:
   ("needs_login"), signed in ("online") or was signed in and is now asking
   again ("logged_out"). The dashboard writes commands to
   data/browsers/<terminal>.cmd.json: "check" (look up containers), "focus"
-  (bring the window to the front) and "close". A container is screenshotted
+  (bring the window to the front) and "close". mcp_server.py may also send
+  "inspect" (describe the current page for development); the answer goes to
+  data/browsers/<terminal>.inspect.json and never includes field values. A container is screenshotted
   when the page does not clearly offer a return, and the outcome goes back in
   the status file for the desk to record.
 
@@ -228,6 +230,97 @@ def fill_login(page, terminal_id: str) -> str | None:
         except Exception:
             continue
     return None
+
+
+# Describes the current page for development (mcp_server.py). Lists fields by
+# name/id/label but NEVER their values; only whether a field has a value.
+DESCRIBE_PAGE_JS = """(limit) => {
+  const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const text = el => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120);
+  const labelFor = el => {
+    if (el.id) { const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`); if (l) return text(l); }
+    const wrap = el.closest('label'); return wrap ? text(wrap) : '';
+  };
+  const attrs = el => ({ id: el.id || '', name: el.getAttribute('name') || '',
+    class: (el.getAttribute('class') || '').slice(0, 80) });
+  const fields = [...document.querySelectorAll('input, textarea, select')].slice(0, limit).map(el => ({
+    tag: el.tagName.toLowerCase(), type: (el.getAttribute('type') || '').toLowerCase(), ...attrs(el),
+    placeholder: el.getAttribute('placeholder') || '', aria: el.getAttribute('aria-label') || '',
+    label: labelFor(el), visible: visible(el), has_value: !!el.value,
+    options: el.tagName === 'SELECT' ? [...el.options].slice(0, 15).map(o => o.text.trim()) : undefined,
+  }));
+  const buttons = [...document.querySelectorAll('button, input[type=submit], input[type=button], [role=button]')]
+    .slice(0, limit).map(el => ({ text: text(el) || el.getAttribute('value') || '', type: el.getAttribute('type') || '',
+      ...attrs(el), visible: visible(el) }));
+  const links = [...document.querySelectorAll('a[href]')].filter(visible).slice(0, limit)
+    .map(el => ({ text: text(el), href: el.getAttribute('href') }));
+  const tables = [...document.querySelectorAll('table')].slice(0, 10).map(t => ({
+    rows: t.rows.length, first_rows: [...t.rows].slice(0, 4).map(r => [...r.cells].map(c => text(c))) }));
+  return { fields, buttons, links, tables };
+}"""
+
+# Outer HTML for a selector, with every value attribute removed.
+QUERY_JS = """([selector, limit]) => {
+  const found = [...document.querySelectorAll(selector)];
+  return { count: found.length, html: found.slice(0, limit).map(el => {
+    const copy = el.cloneNode(true);
+    [copy, ...copy.querySelectorAll('*')].forEach(n => { if (n.removeAttribute) n.removeAttribute('value'); });
+    return copy.outerHTML.slice(0, 800);
+  }) };
+}"""
+
+
+def inspect_page(page, terminal_id: str, request: dict) -> dict:
+    """Answer an "inspect" command. Read-only; never returns field values."""
+    kind = request.get("kind") or "page"
+    max_chars = max(500, min(int(request.get("max_chars") or 6000), 40000))
+    out: dict = {
+        "request_id": request.get("request_id"),
+        "terminal_id": terminal_id,
+        "url": page.url,
+        "frames": [frame.url for frame in page.frames if frame.url and frame.url != "about:blank"],
+    }
+    try:
+        out["title"] = page.title()
+    except Exception:
+        out["title"] = ""
+    if kind == "query":
+        selector = str(request.get("selector") or "")
+        results = []
+        for frame in page.frames:
+            try:
+                found = frame.evaluate(QUERY_JS, [selector, 5])
+            except Exception as exc:
+                out["error"] = str(exc).splitlines()[0]
+                break
+            if found["count"]:
+                results.append({"frame": frame.url, **found})
+        out["matches"] = results
+        return out
+    try:
+        out["page"] = page.evaluate(DESCRIBE_PAGE_JS, 60)
+    except Exception as exc:
+        out["page_error"] = str(exc).splitlines()[0]
+    out["text"] = page_text(page)[:max_chars]
+    out["login_state"] = login_state(page, terminal_id, page.url, True)
+    if request.get("screenshot", True):
+        folder = SHOTS / "_inspect"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{terminal_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        try:
+            page.screenshot(path=str(path), full_page=bool(request.get("full_page")))
+            out["screenshot"] = str(path)
+        except Exception as exc:
+            out["screenshot_error"] = str(exc).splitlines()[0]
+    return out
+
+
+def write_inspect_answer(terminal_id: str, answer: dict) -> None:
+    BROWSERS.mkdir(parents=True, exist_ok=True)
+    path = BROWSERS / f"{terminal_id}.inspect.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(answer, indent=2))
+    temporary.replace(path)
 
 
 LOGIN_URL_HINTS = ("login", "signin", "sign-in", "sign_in", "/auth", "logon")
@@ -685,6 +778,12 @@ def serve(terminal_id: str, session_id: str) -> int:
                 action = command.get("action") if command else None
                 if action == "close":
                     break
+                if action == "inspect":
+                    try:
+                        answer = inspect_page(current, terminal_id, command)
+                    except Exception as exc:
+                        answer = {"request_id": command.get("request_id"), "error": str(exc).splitlines()[0]}
+                    write_inspect_answer(terminal_id, answer)
                 if action == "focus":
                     try:
                         current.bring_to_front()
