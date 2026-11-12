@@ -22,6 +22,7 @@ wheels/
 
 # Virtual Environment
 venv/
+.venv/
 env/
 ENV/
 
@@ -44,3 +45,9 @@ terminal_screenshots/
 # Local development settings
 .env
 .env.local
+
+# Rust dashboard
+dashboard/target/
+
+# Live browser session between the dashboard and Playwright
+data/
