@@ -3,12 +3,24 @@
 Two ways in:
 
 * Dashboard mode (``--terminal ID --session ID``): the Rust dashboard starts
-  this process. It opens the terminal's sign-in page and waits. The user signs
-  in by hand, including any captcha. This program never reads or types a
-  password. The dashboard then writes data/browser_command.json with action
-  "check". This process screenshots a container only when the page shows no
-  return appointment, and writes the outcome to data/browser_session.json for
-  the desk to record.
+  one process per terminal, so several browsers can be open at once. Each
+  opens the terminal's sign-in page and waits. The user signs in by hand,
+  including any captcha. This program never reads or types a password.
+
+  Every few seconds it writes data/browsers/<terminal>.json with the address
+  of each open tab and whether the page is asking for a sign-in
+  ("needs_login"), signed in ("online") or was signed in and is now asking
+  again ("logged_out"). The dashboard writes commands to
+  data/browsers/<terminal>.cmd.json: "check" (look up containers), "focus"
+  (bring the window to the front) and "close". A container is screenshotted
+  when the page does not clearly offer a return, and the outcome goes back in
+  the status file for the desk to record.
+
+  When a sign-in page is showing and a login is saved for that terminal's
+  login system, the browser fills in the ID and password from the
+  credentials folder (see ``credentials_dir``). It never presses Sign in and
+  never overwrites fields the user has started typing in. The user solves
+  any captcha and signs in. Passwords are never written to logs or status.
 
 * CLI mode (``run_cli``): APM.py and LBCT.py open the same browser, wait for
   the user to sign in and press Enter, then run the same checks and print the
@@ -75,6 +87,23 @@ PUBLIC_PAGES = {
     },
 }
 
+# Pages that are errors or sign-in prompts, not a terminal's answer.
+ERROR_PHRASES = (
+    "service unavailable",
+    "temporarily unavailable",
+    "server error",
+    "something went wrong",
+    "page not found",
+    "access denied",
+    "session expired",
+    "session has expired",
+    "session timed out",
+    "please log in",
+    "please sign in",
+    "bad gateway",
+    "gateway timeout",
+)
+
 REFUSAL_PHRASES = (
     "no appointment",
     "no appointments",
@@ -88,10 +117,157 @@ REFUSAL_PHRASES = (
 )
 
 
+BROWSERS = DATA / "browsers"
+
+# Visible fields that mean "this page wants a sign-in".
+LOGIN_SELECTORS = {
+    "apm": 'input[name="Login_Nm"]',
+    "lbct": "input.loginBoxInputUser",
+}
+# Which saved login each terminal's sign-in page uses. Keep in step with
+# Terminal::account in dashboard/src/model.rs.
+ACCOUNT_OF = {
+    "apm": "termpoint",
+    "lbct": "lbct",
+    "fenix": "fenix",
+    "wbct": "voyagertrack",
+    "yti": "yti",
+}
+ACCOUNT_NAMES = {
+    "termpoint": "TERMPoint",
+    "lbct": "LBCT portal",
+    "emodal": "eModal",
+    "fenix": "Fenix portal",
+    "voyagertrack": "VoyagerTrack",
+    "yti": "YTI",
+}
+# Known sign-in fields: (ID field, password field).
+FILL_SELECTORS = {
+    "apm": ('input[name="Login_Nm"]', 'input[name="Login_Pwd"]'),
+    "lbct": ("input.loginBoxInputUser", "input.loginBoxInputPassword"),
+}
+
+# Marks the ID and password fields of the first visible login form in a frame.
+MARK_LOGIN_JS = """() => {
+  const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+    && getComputedStyle(el).visibility !== 'hidden';
+  document.querySelectorAll('[data-desk-user],[data-desk-pass]').forEach(el => {
+    el.removeAttribute('data-desk-user'); el.removeAttribute('data-desk-pass');
+  });
+  const pass = [...document.querySelectorAll('input[type=password]')].find(visible);
+  if (!pass) return false;
+  const scope = pass.form || document;
+  const kinds = ['', 'text', 'email', 'tel'];
+  let user = null;
+  for (const el of scope.querySelectorAll('input')) {
+    if (el === pass) break;
+    if (kinds.includes((el.getAttribute('type') || '').toLowerCase()) && visible(el) && !el.disabled && !el.readOnly) user = el;
+  }
+  if (!user) return false;
+  user.setAttribute('data-desk-user', '1');
+  pass.setAttribute('data-desk-pass', '1');
+  return true;
+}"""
+
+
+def account_for(terminal_id: str) -> str:
+    return ACCOUNT_OF.get(terminal_id, "emodal")
+
+
+def credentials_dir() -> Path:
+    override = os.getenv("DESK_CREDENTIALS_DIR", "").strip()
+    if override:
+        return Path(override)
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "EmptyReturnDesk" / "credentials"
+    return home / ".local" / "share" / "empty-return-desk" / "credentials"
+
+
+def load_login(account: str) -> tuple[str, str] | None:
+    """Saved (ID, password) for a login system, read fresh each time."""
+    if account not in ACCOUNT_NAMES:
+        return None
+    try:
+        data = json.loads((credentials_dir() / f"{account}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    user = str(data.get("user_id") or "").strip()
+    password = str(data.get("password") or "")
+    return (user, password) if user and password else None
+
+
+def fill_login(page, terminal_id: str) -> str | None:
+    """Fill the saved login into a visible sign-in form. Never submits.
+
+    Returns "filled", "kept" (a form is there but the user already typed in
+    it, or no login is saved), or None (no sign-in form found yet).
+    """
+    login = load_login(account_for(terminal_id))
+    for frame in page.frames:
+        try:
+            user_field = pass_field = None
+            known = FILL_SELECTORS.get(terminal_id)
+            if known and frame == page.main_frame:
+                u = frame.locator(f"{known[0]}:visible").first
+                p = frame.locator(f"{known[1]}:visible").first
+                if u.count() and p.count():
+                    user_field, pass_field = u, p
+            if user_field is None and frame.evaluate(MARK_LOGIN_JS):
+                user_field = frame.locator("[data-desk-user]").first
+                pass_field = frame.locator("[data-desk-pass]").first
+            if user_field is None:
+                continue
+            if login is None:
+                return "kept"
+            if user_field.input_value() or pass_field.input_value():
+                return "kept"
+            user_field.fill(login[0])
+            pass_field.fill(login[1])
+            return "filled"
+        except Exception:
+            continue
+    return None
+
+
+LOGIN_URL_HINTS = ("login", "signin", "sign-in", "sign_in", "/auth", "logon")
+PROBE_SECONDS = 3.0
+
+
+def login_state(page, terminal_id: str, start_url: str, seen_online: bool) -> str:
+    """Return "needs_login" or "online" for the page the user is on."""
+    try:
+        selector = LOGIN_SELECTORS.get(terminal_id)
+        if selector and page.locator(f"{selector}:visible").count() > 0:
+            return "needs_login"
+        if page.locator('input[type="password"]:visible').count() > 0:
+            return "needs_login"
+    except Exception:
+        return "needs_login" if not seen_online else "online"
+    url = (page.url or "").lower()
+    if any(hint in url for hint in LOGIN_URL_HINTS):
+        return "needs_login"
+    # Still on the page we opened and never signed in: not signed in yet.
+    if not seen_online and url.rstrip("/") == start_url.lower().rstrip("/"):
+        return "needs_login"
+    return "online"
+
+
+def tab_info(pages) -> list[dict]:
+    tabs = []
+    for page in pages:
+        try:
+            title = page.title()
+        except Exception:
+            title = ""
+        tabs.append({"url": page.url, "title": title})
+    return tabs
+
+
 class Session:
     def __init__(self, session_id: str, terminal_id: str) -> None:
-        self.path = DATA / "browser_session.json"
-        self.command_path = DATA / "browser_command.json"
+        self.path = BROWSERS / f"{terminal_id}.json"
+        self.command_path = BROWSERS / f"{terminal_id}.cmd.json"
         self.session_id = session_id
         self.terminal_id = terminal_id
         self.rev = 0
@@ -100,6 +276,13 @@ class Session:
         self.results: list[dict] = []
         self.date = ""
         self.shift = ""
+        self.login = "needs_login"
+        self.seen_online = False
+        self.start_url = ""
+        self.tabs: list[dict] = []
+        self.url = ""
+        self.pending: list[dict] = []
+        self.fill_key: tuple | None = None
 
     def publish(
         self,
@@ -123,19 +306,70 @@ class Session:
             "status": self.status,
             "terminal_id": self.terminal_id,
             "message": self.message,
+            "login": self.login,
+            "url": self.url,
+            "tabs": self.tabs,
             "date": self.date,
             "shift": shift,
             "results": self.results,
             "heartbeat": time.time(),
         }
-        DATA.mkdir(parents=True, exist_ok=True)
+        BROWSERS.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(payload, indent=2))
         temporary.replace(self.path)
 
+    def next_command(self) -> dict | None:
+        if self.pending:
+            return self.pending.pop(0)
+        return pop_command(self.command_path)
+
     def stop_requested(self) -> bool:
-        command = pop_command()
-        return bool(command and command.get("action") == "close")
+        command = pop_command(self.command_path)
+        if not command:
+            return False
+        if command.get("action") == "close":
+            return True
+        self.pending.append(command)
+        return False
+
+    def try_fill(self, page) -> None:
+        """Fill the saved login once per sign-in page load."""
+        key = (id(page), page.url)
+        if key == self.fill_key:
+            return
+        outcome = fill_login(page, self.terminal_id)
+        if outcome is None:
+            return
+        self.fill_key = key
+        name = ACCOUNT_NAMES[account_for(self.terminal_id)]
+        if outcome == "filled":
+            self.message = f"Saved {name} login filled in. Solve any captcha and press Sign in."
+        elif load_login(account_for(self.terminal_id)) is None:
+            self.message = f"No saved {name} login. Sign in by hand or add it under Logins."
+
+    def probe(self, pages, current) -> None:
+        """Refresh tab addresses and sign-in state; publish as a heartbeat."""
+        self.tabs = tab_info(pages)
+        self.url = current.url
+        state = login_state(current, self.terminal_id, self.start_url, self.seen_online)
+        previous = self.login
+        if state == "online":
+            self.seen_online = True
+            self.login = "online"
+            if previous != "online":
+                self.message = "Signed in."
+        elif self.seen_online:
+            self.login = "logged_out"
+            if previous != "logged_out":
+                self.message = "Signed out (session expired?). Sign in again in the browser window."
+        else:
+            self.login = "needs_login"
+        if self.login != "online":
+            self.try_fill(current)
+        if self.status not in {"checking", "closed", "error"}:
+            self.status = "ready"
+        self.publish()
 
 
 class Console:
@@ -164,28 +398,34 @@ def env_url(terminal_id: str, table: dict | None = None) -> str:
 
 
 def classify_page(text: str) -> tuple[str, str]:
+    """Read a result page. Only a clear refusal or dual-only message counts.
+
+    "open" is never decided from page text alone; a checker must see real
+    evidence (for example APM's slot list). Error pages are never refusals.
+    """
     lowered = " ".join(text.lower().split())
+    for phrase in ERROR_PHRASES:
+        if phrase in lowered:
+            return "could_not_check", f"Page shows an error (“{phrase}”), not a terminal answer."
     if "dual only" in lowered or "dual-only" in lowered:
         return "dual_only", "Page shows dual only."
     for phrase in REFUSAL_PHRASES:
         if phrase in lowered:
             return "no_slots", f"Page says “{phrase}”."
-    if "available" in lowered:
-        return "open", "A return slot is offered."
-    return "could_not_check", "Could not tell whether a return appointment is offered."
+    return "could_not_check", "No refusal message on the page. Look at the screenshot and set the finding."
 
 
-def save_shot(page, terminal_id: str, container: str) -> str:
+def save_shot(page, terminal_id: str, container: str, finding: str = "no_return") -> str:
     folder = SHOTS / terminal_id
     folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = folder / f"{container}_no_return_{stamp}.png"
+    label = "check" if finding == "could_not_check" else "no_return"
+    path = folder / f"{container}_{label}_{stamp}.png"
     page.screenshot(path=str(path), full_page=True)
     return str(path)
 
 
-def pop_command() -> dict | None:
-    path = DATA / "browser_command.json"
+def pop_command(path: Path) -> dict | None:
     if not path.exists():
         return None
     try:
@@ -219,9 +459,9 @@ def page_text(page) -> str:
 
 def refusal_result(page, terminal_id: str, container: str, finding: str, note: str) -> dict:
     screenshot = ""
-    if finding in {"no_slots", "closed", "dual_only"}:
+    if finding in {"no_slots", "closed", "dual_only", "could_not_check"}:
         try:
-            screenshot = save_shot(page, terminal_id, container)
+            screenshot = save_shot(page, terminal_id, container, finding)
         except Exception:
             screenshot = ""
     return {
@@ -359,20 +599,6 @@ def _one_lbct(page, container: str, search: str) -> dict:
     page.locator('button[type="submit"]').first.click(timeout=10000)
     settle(page)
     finding, note = classify_page(page_text(page))
-    if finding == "open":
-        return {
-            "container": container,
-            "finding": "open",
-            "note": note,
-            "screenshot": "",
-        }
-    if finding == "could_not_check":
-        return {
-            "container": container,
-            "finding": "could_not_check",
-            "note": note,
-            "screenshot": "",
-        }
     return refusal_result(page, "lbct", container, finding, note)
 
 
@@ -415,6 +641,10 @@ def run_checks(page, terminal_id: str, containers: list[str], session) -> str:
 
 def serve(terminal_id: str, session_id: str) -> int:
     session = Session(session_id, terminal_id)
+    try:
+        session.command_path.unlink(missing_ok=True)
+    except OSError:
+        pass
     session.publish(bump=True)
     try:
         from playwright.sync_api import sync_playwright
@@ -429,45 +659,68 @@ def serve(terminal_id: str, session_id: str) -> int:
     url = env_url(terminal_id)
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=False)
-        page = browser.new_page(viewport={"width": 1400, "height": 900})
+        context = browser.new_context(viewport={"width": 1400, "height": 900})
+        page = context.new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            message = "Browser is open. Sign in yourself, then check containers."
-            if terminal_id not in CHECKERS:
-                message = "Browser is open. Sign in, then record what you find on the board. Automatic slot check is ready for APM and LBCT."
-            session.publish(status="waiting_for_login", message=message)
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as exc:
+                session.message = f"Could not load {url}: {str(exc).splitlines()[0]}"
+            session.start_url = page.url
+            if terminal_id in CHECKERS:
+                hint = "Sign in yourself, then check containers."
+            else:
+                hint = "Sign in yourself, then record what you find on the board."
+            if not session.message.startswith("Could not load"):
+                session.message = f"Browser is open. {hint}"
+            last_probe = 0.0
 
             while browser.is_connected():
-                command = pop_command()
-                if command and command.get("action") == "close":
-                    session.publish(status="closed", message="Browser closed.", bump=True)
+                pages = [p for p in context.pages if not p.is_closed()]
+                if not pages:
                     break
-                if command and command.get("action") == "check":
-                    containers = []
-                    for raw in command.get("containers") or []:
-                        container = normalize_container(raw)
-                        if container:
-                            containers.append(container)
+                current = pages[-1]
+
+                command = session.next_command()
+                action = command.get("action") if command else None
+                if action == "close":
+                    break
+                if action == "focus":
+                    try:
+                        current.bring_to_front()
+                    except Exception:
+                        pass
+                if action == "check":
+                    containers = [
+                        c for c in (normalize_container(raw) for raw in command.get("containers") or []) if c
+                    ]
                     session.date = str(command.get("date") or "")
                     session.shift = str(command.get("shift") or "")
                     if not containers:
                         session.publish(message="Enter at least one container to check.")
                     else:
-                        outcome = run_checks(page, terminal_id, containers, session)
+                        outcome = run_checks(current, terminal_id, containers, session)
                         if outcome == "closed":
                             break
+                    last_probe = 0.0
+
+                if time.time() - last_probe >= PROBE_SECONDS:
+                    try:
+                        session.probe(pages, current)
+                    except Exception:
+                        pass
+                    last_probe = time.time()
                 try:
-                    page.wait_for_timeout(400)
+                    current.wait_for_timeout(400)
                 except Exception:
-                    session.publish(status="closed", message="Browser window was closed.", bump=True)
-                    break
+                    # That tab closed; the loop picks the next one or ends.
+                    time.sleep(0.2)
         finally:
             try:
                 browser.close()
             except Exception:
                 pass
-    if session.status != "closed":
-        session.publish(status="closed", message="Browser closed.", bump=True)
+    session.publish(status="closed", message="Browser closed.", bump=True)
     return 0
 
 
@@ -495,6 +748,13 @@ def run_cli(terminal_id: str, containers: list[str]) -> int:
             url = env_url(terminal_id)
             print(f"Opening {url}")
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            for _ in range(10):
+                outcome = fill_login(page, terminal_id)
+                if outcome is not None:
+                    break
+                page.wait_for_timeout(500)
+            if outcome == "filled":
+                print("Saved login filled in. Solve any captcha and press Sign in.")
             input("Sign in in the browser window (including any captcha), then press Enter here... ")
             results, _closed = CHECKERS[terminal_id](page, containers, console)
         finally:
@@ -512,16 +772,20 @@ def run_cli(terminal_id: str, containers: list[str]) -> int:
 
 
 def _self_test() -> None:
-    finding, _note = classify_page("No appointment slots for this container")
-    assert finding == "no_slots", finding
-    finding, _note = classify_page("Dual only for 40 foot")
-    assert finding == "dual_only", finding
-    finding, _note = classify_page("Appointment available at 14:00")
-    assert finding == "open", finding
-    finding, _note = classify_page("Return is not available today")
-    assert finding == "no_slots", finding
-    finding, _note = classify_page("Container inquiry")
-    assert finding == "could_not_check", finding
+    cases = [
+        ("No appointment slots for this container", "no_slots"),
+        ("Dual only for 40 foot", "dual_only"),
+        ("Return is not available today", "no_slots"),
+        # Never "open" from text alone.
+        ("Appointment available at 14:00", "could_not_check"),
+        ("Container inquiry", "could_not_check"),
+        # Error pages are not refusals.
+        ("503 Service Unavailable", "could_not_check"),
+        ("Your session has expired. No appointments shown.", "could_not_check"),
+    ]
+    for text, expected in cases:
+        finding, _note = classify_page(text)
+        assert finding == expected, (text, finding)
 
 
 def main() -> int:

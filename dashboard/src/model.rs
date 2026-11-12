@@ -176,7 +176,38 @@ pub struct Terminal {
     pub auto_check: bool,
 }
 
+/// Login systems. Several terminals share one (eModal). Keep in step with
+/// ACCOUNT_OF in desk_browser.py.
+pub const ACCOUNTS: [(&str, &str); 6] = [
+    ("termpoint", "TERMPoint"),
+    ("lbct", "LBCT portal"),
+    ("emodal", "eModal"),
+    ("fenix", "Fenix portal"),
+    ("voyagertrack", "VoyagerTrack"),
+    ("yti", "YTI"),
+];
+
+pub fn account_name(account: &str) -> &'static str {
+    ACCOUNTS
+        .iter()
+        .find(|(id, _)| *id == account)
+        .map(|(_, name)| *name)
+        .unwrap_or("Login")
+}
+
 impl Terminal {
+    /// Which saved login this terminal's sign-in page uses.
+    pub fn account(&self) -> &'static str {
+        match self.id {
+            "apm" => "termpoint",
+            "lbct" => "lbct",
+            "fenix" => "fenix",
+            "wbct" => "voyagertrack",
+            "yti" => "yti",
+            _ => "emodal",
+        }
+    }
+
     pub fn where_to_look(&self) -> &'static str {
         if self.empty_url.is_some() {
             "Public schedule and appointment portal"
@@ -470,6 +501,19 @@ const TERMINALS: [Terminal; 11] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_terminal_has_a_known_account() {
+        for terminal in terminals() {
+            assert!(
+                ACCOUNTS.iter().any(|(id, _)| *id == terminal.account()),
+                "{}",
+                terminal.id
+            );
+        }
+        assert_eq!(terminal("its").unwrap().account(), "emodal");
+        assert_eq!(account_name("termpoint"), "TERMPoint");
+    }
 
     #[test]
     fn packet_lists_only_refusals() {

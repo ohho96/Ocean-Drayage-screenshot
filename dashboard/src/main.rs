@@ -1,17 +1,19 @@
 mod browser;
+mod credentials;
 mod model;
 mod store;
 
 use std::collections::HashMap;
 
-use browser::{repo_root, BrowserBridge, ImportBatch, ScheduleShot};
+use browser::{now_secs, repo_root, BrowserManager, BrowserState, ImportBatch, ScheduleShot};
 use eframe::egui::{
     self, Align, Button, Color32, ComboBox, CornerRadius, CursorIcon, Frame, Layout, Margin,
     RichText, ScrollArea, Sense, Stroke, TextEdit, Vec2,
 };
+use credentials::{credentials_dir, Login};
 use model::{
-    check_key, full_board, normalize_container, proof_packet, receiving_board, terminal, terminals,
-    BoxSize, Check, Evidence, Finding, Port, ReceiveStatus, Receiving, Shift, Terminal, LINES,
+    account_name, check_key, full_board, normalize_container, proof_packet, receiving_board, terminal, terminals,
+    BoxSize, Check, Evidence, Finding, Port, ReceiveStatus, Receiving, Shift, Terminal, ACCOUNTS, LINES,
 };
 use store::Saved;
 
@@ -63,6 +65,23 @@ enum Screen {
     Board,
     Receiving,
     Evidence,
+    Logins,
+}
+
+/// Edit fields for one login system on the Logins screen. The saved password
+/// is never loaded into the form; a blank password keeps the saved one.
+#[derive(Default)]
+struct LoginDraft {
+    user_id: String,
+    password: String,
+    show: bool,
+    confirm_delete: bool,
+}
+
+/// What the desk shows about a saved login, without the password.
+struct SavedLogin {
+    user_id: String,
+    updated_at: String,
 }
 
 struct Desk {
@@ -87,12 +106,21 @@ struct Desk {
     draft_line: String,
     draft_size: BoxSize,
     draft_receive: ReceiveStatus,
-    browser: BrowserBridge,
+    browser: BrowserManager,
     schedule_shot: Option<ScheduleShot>,
+    login_dir: std::path::PathBuf,
+    saved_logins: HashMap<String, SavedLogin>,
+    login_drafts: HashMap<String, LoginDraft>,
 }
 
 impl Desk {
     fn new() -> Self {
+        let mut desk = Self::build();
+        desk.refresh_logins();
+        desk
+    }
+
+    fn build() -> Self {
         let path = store::state_path();
         let root = repo_root();
         let (saved, status) = match store::load(&path) {
@@ -126,9 +154,80 @@ impl Desk {
             draft_line: "Maersk".to_string(),
             draft_size: BoxSize::Forty,
             draft_receive: ReceiveStatus::Receiving,
-            browser: BrowserBridge::new(root),
+            browser: BrowserManager::new(root),
             schedule_shot: None,
+            login_dir: credentials_dir(),
+            saved_logins: HashMap::new(),
+            login_drafts: HashMap::new(),
         }
+    }
+
+    /// Re-read which logins are saved (IDs only) and reset the edit forms.
+    fn refresh_logins(&mut self) {
+        self.saved_logins.clear();
+        for (account, _) in ACCOUNTS {
+            if let Some(login) = credentials::load(&self.login_dir, account) {
+                self.saved_logins.insert(
+                    account.to_string(),
+                    SavedLogin {
+                        user_id: login.user_id.clone(),
+                        updated_at: login.updated_at.clone(),
+                    },
+                );
+                let draft = self.login_drafts.entry(account.to_string()).or_default();
+                draft.user_id = login.user_id;
+            }
+        }
+    }
+
+    fn save_login(&mut self, account: &str) {
+        let Some(draft) = self.login_drafts.get(account) else {
+            return;
+        };
+        let user_id = draft.user_id.trim().to_string();
+        if user_id.is_empty() {
+            self.status = "Enter the login ID.".to_string();
+            return;
+        }
+        let password = if draft.password.is_empty() {
+            match credentials::load(&self.login_dir, account) {
+                Some(existing) => existing.password,
+                None => {
+                    self.status = "Enter the password.".to_string();
+                    return;
+                }
+            }
+        } else {
+            draft.password.clone()
+        };
+        let login = Login {
+            account: account.to_string(),
+            user_id,
+            password,
+            updated_at: timestamp(),
+        };
+        match credentials::save(&self.login_dir, &login) {
+            Ok(()) => {
+                if let Some(draft) = self.login_drafts.get_mut(account) {
+                    draft.password.clear();
+                    draft.show = false;
+                }
+                self.status = format!("{} login saved.", account_name(account));
+            }
+            Err(err) => self.status = format!("Could not save login: {err}"),
+        }
+        self.refresh_logins();
+    }
+
+    fn delete_login(&mut self, account: &str) {
+        match credentials::delete(&self.login_dir, account) {
+            Ok(()) => {
+                self.login_drafts.remove(account);
+                self.status = format!("{} login deleted.", account_name(account));
+            }
+            Err(err) => self.status = format!("Could not delete login: {err}"),
+        }
+        self.refresh_logins();
     }
 
     fn snapshot(&self) -> Saved {
@@ -271,8 +370,8 @@ impl Desk {
             .collect()
     }
 
-    fn open_browser(&mut self) {
-        match self.browser.open(&self.selected) {
+    fn open_browser(&mut self, terminal_id: &str) {
+        match self.browser.open(terminal_id) {
             Ok(()) => {
                 self.status = "Browser opening. Sign in there, then check containers.".to_string();
             }
@@ -280,7 +379,7 @@ impl Desk {
         }
     }
 
-    fn check_containers(&mut self) {
+    fn check_containers(&mut self, terminal_id: &str) {
         let mut containers = self.container_list();
         if containers.is_empty() {
             let one = normalize_container(&self.container);
@@ -292,14 +391,23 @@ impl Desk {
             self.status = "Enter at least one container to check.".to_string();
             return;
         }
-        match self.browser.check(&containers, &self.date, self.shift) {
+        match self
+            .browser
+            .check(terminal_id, &containers, &self.date, self.shift)
+        {
             Ok(()) => self.status = format!("Checking {} containers.", containers.len()),
             Err(err) => self.status = err,
         }
     }
 
-    fn close_browser(&mut self) {
-        if let Err(err) = self.browser.close() {
+    fn focus_browser(&mut self, terminal_id: &str) {
+        if let Err(err) = self.browser.focus(terminal_id) {
+            self.status = err;
+        }
+    }
+
+    fn close_browser(&mut self, terminal_id: &str) {
+        if let Err(err) = self.browser.close(terminal_id) {
             self.status = err;
             return;
         }
@@ -360,11 +468,26 @@ impl Desk {
             self.status = "Enter a shipping line.".to_string();
             return;
         }
-        let size = self.draft_size;
-        let status = self.draft_receive;
+        let (date, shift, size, status) =
+            (self.date.clone(), self.shift, self.draft_size, self.draft_receive);
+        self.upsert_receiving(&date, shift, terminal_id, line, size, status);
+        self.persist();
+        self.status = "Receiving location saved.".to_string();
+    }
+
+    /// Add or update one receiving row, keyed by date, shift, terminal, line and size.
+    fn upsert_receiving(
+        &mut self,
+        date: &str,
+        shift: Shift,
+        terminal_id: &str,
+        line: String,
+        size: BoxSize,
+        status: ReceiveStatus,
+    ) {
         if let Some(row) = self.receivings.iter_mut().find(|row| {
-            row.date == self.date
-                && row.shift == self.shift
+            row.date == date
+                && row.shift == shift
                 && row.terminal_id == terminal_id
                 && row.line.eq_ignore_ascii_case(&line)
                 && row.size == size
@@ -377,8 +500,8 @@ impl Desk {
             self.next_id += 1;
             self.receivings.push(Receiving {
                 id,
-                date: self.date.clone(),
-                shift: self.shift,
+                date: date.to_string(),
+                shift,
                 terminal_id: terminal_id.to_string(),
                 line,
                 size,
@@ -386,8 +509,6 @@ impl Desk {
                 updated_at: timestamp(),
             });
         }
-        self.persist();
-        self.status = "Receiving location saved.".to_string();
     }
 
     fn remove_receiving(&mut self, id: u64) {
@@ -419,12 +540,28 @@ impl Desk {
         let terminal_id = job.terminal_id.clone();
         self.schedule_shot = None;
         match outcome {
-            Ok(path) => {
+            Ok(shot) => {
+                let path = shot.screenshot;
+                let count = shot.receiving.len();
+                for row in shot.receiving {
+                    self.upsert_receiving(
+                        &row.date, row.shift, &terminal_id, row.line, row.size, row.status,
+                    );
+                }
+                if count > 0 {
+                    self.persist();
+                }
+                let rows = if count > 0 {
+                    format!(" {count} receiving rows updated from the schedule.")
+                } else {
+                    String::new()
+                };
                 if self.selected == terminal_id {
                     self.draft_shot = path.clone();
-                    self.status = format!("Schedule saved to {path}. Set the finding and record it.");
+                    self.status =
+                        format!("Schedule saved to {path}.{rows} Set the finding and record it.");
                 } else {
-                    self.status = format!("Schedule saved to {path}.");
+                    self.status = format!("Schedule saved to {path}.{rows}");
                 }
             }
             Err(err) => self.status = err,
@@ -460,19 +597,16 @@ impl Desk {
 impl eframe::App for Desk {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_schedule_shot();
-        if self.browser.active || self.schedule_shot.is_some() {
+        if self.browser.any_open() || self.schedule_shot.is_some() {
             // Keep polling the Python side even when the mouse is still.
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(500));
         }
-        let imported = self.browser.poll();
-        if let Some(batch) = imported {
+        for batch in self.browser.poll() {
             self.import_results(batch);
         }
-        if let Some(message) = self.browser.take_notice() {
-            if !message.is_empty() {
-                self.status = message;
-            }
+        if let Some(message) = self.browser.take_notices().pop() {
+            self.status = message;
         }
         egui::Panel::top("header").show(ui, |ui| header(self, ui));
         self.sync_draft();
@@ -490,6 +624,8 @@ impl eframe::App for Desk {
             egui::CentralPanel::default().show(ui, |ui| board(self, ui));
         } else if self.screen == Screen::Receiving {
             egui::CentralPanel::default().show(ui, |ui| receiving(self, ui));
+        } else if self.screen == Screen::Logins {
+            egui::CentralPanel::default().show(ui, |ui| logins(self, ui));
         } else {
             egui::CentralPanel::default().show(ui, |ui| evidence(self, ui));
         }
@@ -513,6 +649,8 @@ fn header(desk: &mut Desk, ui: &mut egui::Ui) {
         screen_button(ui, &mut desk.screen, Screen::Receiving, "Receiving");
         let evidence_label = format!("Evidence ({})", desk.log.len());
         screen_button(ui, &mut desk.screen, Screen::Evidence, &evidence_label);
+        let logins_label = format!("Logins ({}/{})", desk.saved_logins.len(), ACCOUNTS.len());
+        screen_button(ui, &mut desk.screen, Screen::Logins, &logins_label);
 
         ui.separator();
         ui.label("Container");
@@ -549,7 +687,7 @@ fn header(desk: &mut Desk, ui: &mut egui::Ui) {
             desk.persist();
         }
     });
-    browser_banner(desk, ui);
+    browser_list(desk, ui);
 }
 
 fn screen_button(ui: &mut egui::Ui, current: &mut Screen, screen: Screen, label: &str) {
@@ -564,38 +702,180 @@ fn screen_button(ui: &mut egui::Ui, current: &mut Screen, screen: Screen, label:
     }
 }
 
-fn browser_banner(desk: &mut Desk, ui: &mut egui::Ui) {
-    if !desk.browser.active {
+fn state_color(state: BrowserState) -> Color32 {
+    match state {
+        BrowserState::Online => OPEN,
+        BrowserState::Starting | BrowserState::Checking => ACCENT,
+        BrowserState::NeedsLogin
+        | BrowserState::SignedOut
+        | BrowserState::NotResponding
+        | BrowserState::Error => REFUSAL,
+    }
+}
+
+fn short_url(url: &str, max: usize) -> String {
+    let trimmed = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    if trimmed.chars().count() <= max {
+        trimmed.to_string()
+    } else {
+        let head: String = trimmed.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
+}
+
+enum BrowserAction {
+    Show,
+    Check,
+    Close,
+}
+
+/// Every open terminal browser: sign-in state, address, and controls.
+fn browser_list(desk: &mut Desk, ui: &mut egui::Ui) {
+    if !desk.browser.any_open() {
         return;
     }
-    let name = terminal(&desk.browser.terminal_id)
-        .map(|terminal| terminal.name)
-        .unwrap_or("Terminal");
-    let auto = terminal(&desk.browser.terminal_id)
-        .map(|terminal| terminal.auto_check)
-        .unwrap_or(false);
-    let checking = desk.browser.status_text == "checking";
+    let now = now_secs();
+    let attention = desk
+        .browser
+        .slots
+        .iter()
+        .filter(|slot| slot.state(now).needs_attention())
+        .count();
+    let mut actions: Vec<(BrowserAction, String)> = Vec::new();
+
     ui.add_space(6.0);
     Frame::new()
-        .fill(Color32::from_rgb(42, 36, 24))
+        .fill(Color32::from_rgb(34, 37, 44))
         .corner_radius(8)
         .inner_margin(8)
         .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(name).strong().color(ACCENT));
+            ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(desk.browser.message.clone())
+                    RichText::new(format!("BROWSERS ({})", desk.browser.slots.len()))
                         .small()
+                        .strong()
                         .color(MUTED),
                 );
-                if auto && !checking && ui.button("Check containers").clicked() {
-                    desk.check_containers();
-                }
-                if ui.button("Close browser").clicked() {
-                    desk.close_browser();
+                if attention > 0 {
+                    ui.label(
+                        RichText::new(format!("{attention} need you"))
+                            .small()
+                            .strong()
+                            .color(REFUSAL),
+                    );
+                } else {
+                    ui.label(RichText::new("all signed in").small().color(OPEN));
                 }
             });
+            egui::Grid::new("browser-list")
+                .num_columns(5)
+                .spacing(Vec2::new(12.0, 6.0))
+                .show(ui, |ui| {
+                    for slot in &desk.browser.slots {
+                        let state = slot.state(now);
+                        let known = terminal(&slot.terminal_id);
+                        let name = known.map(|t| t.name).unwrap_or("Terminal");
+                        let auto = known.map(|t| t.auto_check).unwrap_or(false);
+
+                        ui.horizontal(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                            ui.painter()
+                                .circle_filled(rect.center(), 5.0, state_color(state));
+                            ui.label(RichText::new(name).strong());
+                        });
+                        ui.label(RichText::new(state.label()).color(state_color(state)));
+
+                        let address = if slot.url.is_empty() {
+                            "—".to_string()
+                        } else {
+                            short_url(&slot.url, 64)
+                        };
+                        let mut hover = slot.url.clone();
+                        if slot.tabs.len() > 1 {
+                            hover = slot
+                                .tabs
+                                .iter()
+                                .map(|tab| {
+                                    if tab.title.is_empty() {
+                                        tab.url.clone()
+                                    } else {
+                                        format!("{} — {}", tab.title, tab.url)
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                        }
+                        ui.horizontal(|ui| {
+                            let link = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(address).monospace().small(),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text(format!("{hover}\n\nClick to copy the address."));
+                            if link.clicked() && !slot.url.is_empty() {
+                                ui.ctx().copy_text(slot.url.clone());
+                            }
+                            if slot.tabs.len() > 1 {
+                                ui.label(
+                                    RichText::new(format!("+{} tabs", slot.tabs.len() - 1))
+                                        .small()
+                                        .color(MUTED),
+                                );
+                            }
+                        });
+
+                        let seen = match slot.seconds_since_seen(now) {
+                            Some(secs) => format!("seen {secs}s ago"),
+                            None => "starting".to_string(),
+                        };
+                        ui.label(RichText::new(seen).small().color(MUTED))
+                            .on_hover_text(slot.message.clone());
+
+                        ui.horizontal(|ui| {
+                            if slot.is_closing() {
+                                ui.label(RichText::new("Closing…").small().color(MUTED));
+                                return;
+                            }
+                            if ui.button("Show").on_hover_text("Bring this browser window to the front").clicked() {
+                                actions.push((BrowserAction::Show, slot.terminal_id.clone()));
+                            }
+                            if auto
+                                && state == BrowserState::Online
+                                && ui.button("Check containers").clicked()
+                            {
+                                actions.push((BrowserAction::Check, slot.terminal_id.clone()));
+                            }
+                            if ui.button("Close").clicked() {
+                                actions.push((BrowserAction::Close, slot.terminal_id.clone()));
+                            }
+                        });
+                        ui.end_row();
+
+                        if state.needs_attention() && !slot.message.is_empty() {
+                            ui.label("");
+                            ui.label(
+                                RichText::new(slot.message.clone())
+                                    .small()
+                                    .color(MUTED),
+                            );
+                            ui.end_row();
+                        }
+                    }
+                });
         });
+
+    for (action, terminal_id) in actions {
+        match action {
+            BrowserAction::Show => desk.focus_browser(&terminal_id),
+            BrowserAction::Check => desk.check_containers(&terminal_id),
+            BrowserAction::Close => desk.close_browser(&terminal_id),
+        }
+    }
 }
 
 fn summary(desk: &mut Desk, ui: &mut egui::Ui) {
@@ -721,6 +1001,10 @@ fn board(desk: &mut Desk, ui: &mut egui::Ui) {
 fn terminal_row(desk: &mut Desk, ui: &mut egui::Ui, terminal: &Terminal) {
     let finding = desk.finding_for(terminal.id);
     let selected = desk.selected == terminal.id;
+    let browser_state = desk
+        .browser
+        .get(terminal.id)
+        .map(|slot| slot.state(now_secs()));
     let fill = if selected {
         Color32::from_rgb(46, 56, 72)
     } else {
@@ -748,6 +1032,13 @@ fn terminal_row(desk: &mut Desk, ui: &mut egui::Ui, terminal: &Terminal) {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(terminal.name).strong());
                         ui.label(RichText::new(terminal.pier).small().color(MUTED));
+                        if let Some(state) = browser_state {
+                            ui.label(
+                                RichText::new(format!("● {}", state.label()))
+                                    .small()
+                                    .color(state_color(state)),
+                            );
+                        }
                     });
                     ui.label(RichText::new(terminal.where_to_look()).small().color(MUTED));
                 });
@@ -786,8 +1077,18 @@ fn detail(desk: &mut Desk, ui: &mut egui::Ui) {
     } else {
         "This terminal does not post a public empty list. Open the browser, sign in, try an empty return, and record that no slot is offered."
     };
-    let login_line =
-        "Sign in yourself in the browser window, including any captcha. The desk never stores or types passwords.";
+    let account = terminal.account();
+    let login_line = if desk.saved_logins.contains_key(account) {
+        format!(
+            "Saved {} login will be filled in on the sign-in page. Solve any captcha and press Sign in yourself.",
+            account_name(account)
+        )
+    } else {
+        format!(
+            "No saved {} login. Sign in by hand, or add it under Logins.",
+            account_name(account)
+        )
+    };
 
     ScrollArea::vertical().show(ui, |ui| {
         ui.add_space(8.0);
@@ -801,13 +1102,27 @@ fn detail(desk: &mut Desk, ui: &mut egui::Ui) {
         ui.label(RichText::new(login_line).small().color(MUTED));
         ui.add_space(12.0);
 
-        let open_browser = Button::new(
-            RichText::new(format!("Open browser — {appt_system}"))
-                .color(Color32::from_rgb(22, 24, 28)),
-        )
-        .fill(ACCENT);
-        if ui.add(open_browser).clicked() {
-            desk.open_browser();
+        let open_state = desk
+            .browser
+            .get(terminal_id)
+            .map(|slot| slot.state(now_secs()));
+        if let Some(state) = open_state {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Browser:").small().color(MUTED));
+                ui.label(RichText::new(state.label()).color(state_color(state)));
+            });
+            if ui.button(format!("Show {appt_system} browser")).clicked() {
+                desk.focus_browser(terminal_id);
+            }
+        } else {
+            let open_browser = Button::new(
+                RichText::new(format!("Open browser — {appt_system}"))
+                    .color(Color32::from_rgb(22, 24, 28)),
+            )
+            .fill(ACCENT);
+            if ui.add(open_browser).clicked() {
+                desk.open_browser(terminal_id);
+            }
         }
 
         if let Some(url) = empty_url {
@@ -884,6 +1199,126 @@ fn detail(desk: &mut Desk, ui: &mut egui::Ui) {
             );
         }
     });
+}
+
+enum LoginAction {
+    Save(String),
+    Delete(String),
+}
+
+fn logins(desk: &mut Desk, ui: &mut egui::Ui) {
+    let mut action: Option<LoginAction> = None;
+    let folder = desk.login_dir.clone();
+    ScrollArea::vertical().show(ui, |ui| {
+        ui.add_space(8.0);
+        ui.label(RichText::new("Logins").size(22.0).strong());
+        ui.label(
+            RichText::new(
+                "When a browser shows a sign-in page, it fills in the saved ID and password. \
+                 You solve any captcha and press Sign in yourself. Nothing is submitted for you.",
+            )
+            .color(MUTED),
+        );
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Saved in {}", folder.display())).small().color(MUTED));
+            if ui.small_button("Open folder").clicked() {
+                let _ = std::fs::create_dir_all(&folder);
+                open_path(&folder.display().to_string());
+            }
+        });
+        ui.label(
+            RichText::new("One file per login system, readable only by your Mac user (owner-only).")
+                .small()
+                .color(MUTED),
+        );
+        ui.add_space(10.0);
+
+        for (account, name) in ACCOUNTS {
+            let used_by: Vec<&str> = terminals()
+                .iter()
+                .filter(|terminal| terminal.account() == account)
+                .map(|terminal| terminal.name)
+                .collect();
+            let saved = desk.saved_logins.get(account);
+            let saved_line = saved.map(|login| {
+                format!("Saved · ID {} · updated {}", login.user_id, login.updated_at)
+            });
+            let draft = desk.login_drafts.entry(account.to_string()).or_default();
+
+            Frame::new()
+                .fill(Color32::from_rgb(34, 38, 46))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(48, 54, 64)))
+                .corner_radius(8)
+                .inner_margin(10)
+                .outer_margin(Margin::symmetric(0, 4))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(name).strong());
+                        match &saved_line {
+                            Some(line) => ui.label(RichText::new(line).small().color(OPEN)),
+                            None => ui.label(RichText::new("Not saved").small().color(MUTED)),
+                        };
+                    });
+                    ui.label(
+                        RichText::new(format!("Used by {}", used_by.join(", ")))
+                            .small()
+                            .color(MUTED),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("ID");
+                        ui.add(
+                            TextEdit::singleline(&mut draft.user_id)
+                                .desired_width(200.0)
+                                .hint_text("Login ID"),
+                        );
+                        ui.label("Password");
+                        let hint = if saved_line.is_some() {
+                            "Saved — leave blank to keep"
+                        } else {
+                            "Password"
+                        };
+                        ui.add(
+                            TextEdit::singleline(&mut draft.password)
+                                .password(!draft.show)
+                                .desired_width(200.0)
+                                .hint_text(hint),
+                        );
+                        if ui
+                            .small_button(if draft.show { "Hide" } else { "Show" })
+                            .on_hover_text("Show what you are typing")
+                            .clicked()
+                        {
+                            draft.show = !draft.show;
+                        }
+                        if ui.button("Save").clicked() {
+                            action = Some(LoginAction::Save(account.to_string()));
+                        }
+                        if saved_line.is_some() {
+                            if draft.confirm_delete {
+                                if ui
+                                    .button(RichText::new("Confirm delete").color(REFUSAL))
+                                    .clicked()
+                                {
+                                    action = Some(LoginAction::Delete(account.to_string()));
+                                }
+                                if ui.small_button("Cancel").clicked() {
+                                    draft.confirm_delete = false;
+                                }
+                            } else if ui.button("Delete").clicked() {
+                                draft.confirm_delete = true;
+                            }
+                        }
+                    });
+                });
+        }
+    });
+    match action {
+        Some(LoginAction::Save(account)) => desk.save_login(&account),
+        Some(LoginAction::Delete(account)) => desk.delete_login(&account),
+        None => {}
+    }
 }
 
 fn evidence(desk: &mut Desk, ui: &mut egui::Ui) {
@@ -1088,8 +1523,12 @@ fn receiving(desk: &mut Desk, ui: &mut egui::Ui) {
         desk.remove_receiving(id);
     }
     if let Some(id) = pending_open {
+        if desk.browser.get(&id).is_some() {
+            desk.focus_browser(&id);
+        } else {
+            desk.open_browser(&id);
+        }
         desk.selected = id;
-        desk.open_browser();
     }
 }
 

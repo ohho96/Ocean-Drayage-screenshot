@@ -5,8 +5,10 @@
     python screenshot.py --terminal its --json   # used by the dashboard
 
 Images are saved to screenshots/<terminal>/schedule_YYYYMMDD_HHMMSS.png.
-With --json the last line printed is {"terminal": ..., "screenshot": ...}
-or {"terminal": ..., "error": ...} for each terminal.
+With --json one line is printed per terminal:
+{"terminal": ..., "screenshot": ..., "receiving": [...]} or
+{"terminal": ..., "error": ...}. "receiving" holds the schedule rows read
+from the page (ITS today; empty for terminals without a reader yet).
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from desk_browser import PUBLIC_PAGES, ROOT, SHOTS, env_url
+from schedules import read_schedule
 
 
 def snap_public(page, terminal_id: str, output_dir=SHOTS, full_page: bool = True) -> str:
@@ -58,8 +61,14 @@ def main() -> int:
             for terminal_id in targets:
                 try:
                     path = snap_public(page, terminal_id, Path(args.output_dir), not args.no_full_page)
-                    out = {"terminal": terminal_id, "screenshot": path}
+                    try:
+                        receiving = read_schedule(page, terminal_id)
+                    except Exception:
+                        receiving = []
+                    out = {"terminal": terminal_id, "screenshot": path, "receiving": receiving}
                     text = f"{terminal_id}: saved {path}"
+                    if receiving:
+                        text += f" ({len(receiving)} schedule rows read)"
                 except Exception as exc:
                     failed += 1
                     out = {"terminal": terminal_id, "error": str(exc).splitlines()[0]}
