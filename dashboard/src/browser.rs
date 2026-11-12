@@ -154,6 +154,7 @@ pub struct BrowserManager {
     root: PathBuf,
     pub slots: Vec<BrowserSlot>,
     notices: Vec<String>,
+    newly_online: Vec<String>,
 }
 
 impl BrowserManager {
@@ -162,6 +163,7 @@ impl BrowserManager {
             root,
             slots: Vec::new(),
             notices: Vec::new(),
+            newly_online: Vec::new(),
         }
     }
 
@@ -175,6 +177,11 @@ impl BrowserManager {
 
     pub fn get(&self, terminal_id: &str) -> Option<&BrowserSlot> {
         self.slots.iter().find(|slot| slot.terminal_id == terminal_id)
+    }
+
+    /// Terminals whose browser just became signed in.
+    pub fn take_newly_online(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.newly_online)
     }
 
     pub fn take_notices(&mut self) -> Vec<String> {
@@ -331,6 +338,9 @@ impl BrowserManager {
             }
 
             let after = slot.state(now);
+            if after == BrowserState::Online && before != BrowserState::Online && before != BrowserState::Checking {
+                self.newly_online.push(slot.terminal_id.clone());
+            }
             if after != before && after.needs_attention() && before != BrowserState::Starting {
                 self.notices.push(format!(
                     "{}: {}",

@@ -2,6 +2,7 @@ mod browser;
 mod credentials;
 mod model;
 mod store;
+mod upload;
 
 use std::collections::HashMap;
 
@@ -12,6 +13,7 @@ use eframe::egui::{
 };
 use credentials::{credentials_dir, Login};
 use model::{
+    boxes_for_day, return_options, return_plan, Upload,
     account_name, check_key, full_board, normalize_container, proof_packet, receiving_board, terminal, terminals,
     BoxSize, Check, Evidence, Finding, Port, ReceiveStatus, Receiving, Shift, Terminal, ACCOUNTS, LINES,
 };
@@ -62,6 +64,7 @@ fn apply_style(ctx: &egui::Context) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
+    Empties,
     Board,
     Receiving,
     Evidence,
@@ -108,6 +111,14 @@ struct Desk {
     draft_receive: ReceiveStatus,
     browser: BrowserManager,
     schedule_shot: Option<ScheduleShot>,
+    /// Schedules waiting to be captured, one at a time: (terminal, automatic).
+    schedule_queue: std::collections::VecDeque<(String, bool)>,
+    shot_is_auto: bool,
+    /// When each terminal's receiving schedule was last captured.
+    last_capture: HashMap<String, (f64, String)>,
+    uploads: Vec<Upload>,
+    paste_text: String,
+    upload_warnings: Vec<String>,
     login_dir: std::path::PathBuf,
     saved_logins: HashMap<String, SavedLogin>,
     login_drafts: HashMap<String, LoginDraft>,
@@ -130,7 +141,8 @@ impl Desk {
         let next_id = saved
             .next_id
             .max(saved.log.iter().map(|entry| entry.id).max().unwrap_or(0) + 1)
-            .max(saved.receivings.iter().map(|row| row.id).max().unwrap_or(0) + 1);
+            .max(saved.receivings.iter().map(|row| row.id).max().unwrap_or(0) + 1)
+            .max(saved.uploads.iter().map(|upload| upload.id).max().unwrap_or(0) + 1);
 
         Self {
             container: saved.container,
@@ -156,6 +168,12 @@ impl Desk {
             draft_receive: ReceiveStatus::Receiving,
             browser: BrowserManager::new(root),
             schedule_shot: None,
+            schedule_queue: std::collections::VecDeque::new(),
+            shot_is_auto: false,
+            last_capture: HashMap::new(),
+            uploads: saved.uploads,
+            paste_text: String::new(),
+            upload_warnings: Vec::new(),
             login_dir: credentials_dir(),
             saved_logins: HashMap::new(),
             login_drafts: HashMap::new(),
@@ -239,6 +257,7 @@ impl Desk {
             next_id: self.next_id,
             containers: self.containers_text.clone(),
             receivings: self.receivings.clone(),
+            uploads: self.uploads.clone(),
         }
     }
 
@@ -516,29 +535,63 @@ impl Desk {
         self.persist();
     }
 
-    fn shoot_schedule(&mut self) {
-        if self.schedule_shot.is_some() {
-            self.status = "A schedule screenshot is already running.".to_string();
+    /// Queue a public-schedule capture. Automatic captures don't touch the finding form.
+    fn shoot_schedule(&mut self, terminal_id: &str, auto: bool) {
+        let running = self
+            .schedule_shot
+            .as_ref()
+            .is_some_and(|job| job.terminal_id == terminal_id);
+        if running || self.schedule_queue.iter().any(|(id, _)| id == terminal_id) {
             return;
         }
-        match ScheduleShot::start(self.browser.root(), &self.selected) {
-            Ok(job) => {
-                self.status = "Taking a screenshot of the public empty schedule.".to_string();
-                self.schedule_shot = Some(job);
+        self.schedule_queue.push_back((terminal_id.to_string(), auto));
+        self.start_next_schedule();
+    }
+
+    fn start_next_schedule(&mut self) {
+        if self.schedule_shot.is_some() {
+            return;
+        }
+        while let Some((terminal_id, auto)) = self.schedule_queue.pop_front() {
+            match ScheduleShot::start(self.browser.root(), &terminal_id) {
+                Ok(job) => {
+                    let name = terminal(&terminal_id).map(|t| t.name).unwrap_or("terminal");
+                    self.status = format!("Capturing {name} empty receiving schedule.");
+                    self.schedule_shot = Some(job);
+                    self.shot_is_auto = auto;
+                    return;
+                }
+                Err(err) => self.status = err,
             }
-            Err(err) => self.status = err,
+        }
+    }
+
+    /// Capture every terminal whose schedule the desk can read, unless done in the last 30 minutes.
+    fn capture_receiving(&mut self, force: bool) {
+        let now = now_secs();
+        for id in SCHEDULE_READERS {
+            let fresh = self
+                .last_capture
+                .get(*id)
+                .is_some_and(|(at, _)| now - at < 30.0 * 60.0);
+            if force || !fresh {
+                self.shoot_schedule(id, true);
+            }
         }
     }
 
     fn poll_schedule_shot(&mut self) {
         let Some(job) = self.schedule_shot.as_ref() else {
+            self.start_next_schedule();
             return;
         };
         let Some(outcome) = job.poll() else {
             return;
         };
         let terminal_id = job.terminal_id.clone();
+        let auto = self.shot_is_auto;
         self.schedule_shot = None;
+        let name = terminal(&terminal_id).map(|t| t.name).unwrap_or("terminal");
         match outcome {
             Ok(shot) => {
                 let path = shot.screenshot;
@@ -548,24 +601,77 @@ impl Desk {
                         &row.date, row.shift, &terminal_id, row.line, row.size, row.status,
                     );
                 }
+                self.last_capture
+                    .insert(terminal_id.clone(), (now_secs(), timestamp()));
                 if count > 0 {
                     self.persist();
                 }
                 let rows = if count > 0 {
-                    format!(" {count} receiving rows updated from the schedule.")
+                    format!(" {count} receiving rows updated.")
                 } else {
                     String::new()
                 };
-                if self.selected == terminal_id {
+                if !auto && self.selected == terminal_id {
                     self.draft_shot = path.clone();
                     self.status =
                         format!("Schedule saved to {path}.{rows} Set the finding and record it.");
                 } else {
-                    self.status = format!("Schedule saved to {path}.{rows}");
+                    self.status = format!("{name} schedule captured.{rows}");
                 }
             }
+            Err(err) => self.status = format!("{name} schedule: {err}"),
+        }
+        self.start_next_schedule();
+    }
+
+    fn add_upload(&mut self, source: String, parsed: upload::Parsed) {
+        self.upload_warnings = parsed.warnings;
+        if parsed.boxes.is_empty() {
+            self.status = format!("No containers found in {source}.");
+            return;
+        }
+        let count = parsed.boxes.len();
+        self.uploads.push(Upload {
+            id: self.next_id,
+            date: self.date.clone(),
+            uploaded_at: timestamp(),
+            source: source.clone(),
+            boxes: parsed.boxes,
+        });
+        self.next_id += 1;
+        self.persist();
+        let warn = if self.upload_warnings.is_empty() {
+            String::new()
+        } else {
+            format!(" {} warnings below.", self.upload_warnings.len())
+        };
+        self.status = format!("Saved {count} empties from {source} for {}.{warn}", self.date);
+    }
+
+    fn upload_file(&mut self, path: &std::path::Path) {
+        let source = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        match upload::parse_file(path) {
+            Ok(parsed) => self.add_upload(source, parsed),
             Err(err) => self.status = err,
         }
+    }
+
+    fn upload_pasted(&mut self) {
+        let text = std::mem::take(&mut self.paste_text);
+        let parsed = upload::parse_text(&text);
+        if parsed.boxes.is_empty() {
+            self.paste_text = text;
+        }
+        self.add_upload("pasted".to_string(), parsed);
+    }
+
+    fn remove_upload(&mut self, id: u64) {
+        self.uploads.retain(|upload| upload.id != id);
+        self.persist();
+        self.status = "Upload removed.".to_string();
     }
 
     fn copy_proof(&self, ui: &egui::Ui) {
@@ -605,6 +711,17 @@ impl eframe::App for Desk {
         for batch in self.browser.poll() {
             self.import_results(batch);
         }
+        if !self.browser.take_newly_online().is_empty() {
+            // Someone just signed in: capture what each terminal is receiving.
+            self.capture_receiving(false);
+        }
+        for file in ui.ctx().input(|input| input.raw.dropped_files.clone()) {
+            let path = file.path().to_path_buf();
+            if !path.as_os_str().is_empty() {
+                self.screen = Screen::Empties;
+                self.upload_file(&path);
+            }
+        }
         if let Some(message) = self.browser.take_notices().pop() {
             self.status = message;
         }
@@ -624,6 +741,8 @@ impl eframe::App for Desk {
             egui::CentralPanel::default().show(ui, |ui| board(self, ui));
         } else if self.screen == Screen::Receiving {
             egui::CentralPanel::default().show(ui, |ui| receiving(self, ui));
+        } else if self.screen == Screen::Empties {
+            egui::CentralPanel::default().show(ui, |ui| empties(self, ui));
         } else if self.screen == Screen::Logins {
             egui::CentralPanel::default().show(ui, |ui| logins(self, ui));
         } else {
@@ -645,6 +764,8 @@ fn header(desk: &mut Desk, ui: &mut egui::Ui) {
     });
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
+        let today_count = boxes_for_day(&desk.uploads, &desk.date).len();
+        screen_button(ui, &mut desk.screen, Screen::Empties, &format!("Empties ({today_count})"));
         screen_button(ui, &mut desk.screen, Screen::Board, "Board");
         screen_button(ui, &mut desk.screen, Screen::Receiving, "Receiving");
         let evidence_label = format!("Evidence ({})", desk.log.len());
@@ -1129,14 +1250,19 @@ fn detail(desk: &mut Desk, ui: &mut egui::Ui) {
             if ui.button("Open empty schedule").clicked() {
                 open_link(ui, url);
             }
-            let busy = desk.schedule_shot.is_some();
+            let busy = desk
+                .schedule_shot
+                .as_ref()
+                .is_some_and(|job| job.terminal_id == terminal_id)
+                || desk.schedule_queue.iter().any(|(id, _)| id == terminal_id);
             let label = if busy {
                 "Taking schedule screenshot…"
             } else {
                 "Screenshot empty schedule"
             };
             if ui.add_enabled(!busy, Button::new(label)).clicked() {
-                desk.shoot_schedule();
+                let id = desk.selected.clone();
+                desk.shoot_schedule(&id, false);
             }
         } else {
             ui.label(
@@ -1199,6 +1325,246 @@ fn detail(desk: &mut Desk, ui: &mut egui::Ui) {
             );
         }
     });
+}
+
+/// Terminals whose public schedule the desk can read into the receiving board.
+const SCHEDULE_READERS: &[&str] = &["its", "trapac"];
+
+enum UploadAction {
+    ChooseFile,
+    Paste,
+    Remove(u64),
+    UseForChecks,
+    CopyPlan,
+    Capture,
+}
+
+fn empties(desk: &mut Desk, ui: &mut egui::Ui) {
+    let mut action: Option<UploadAction> = None;
+    let date = desk.date.clone();
+    let shift = desk.shift;
+    let boxes = boxes_for_day(&desk.uploads, &date);
+    let day_uploads: Vec<&Upload> = desk.uploads.iter().filter(|u| u.date == date).collect();
+
+    ScrollArea::vertical().show(ui, |ui| {
+        ui.add_space(8.0);
+        ui.label(RichText::new(format!("Empties for {date}")).size(22.0).strong());
+        ui.label(
+            RichText::new(
+                "Upload today's list of empties that need a return appointment. \
+                 Drop a CSV or Excel file on this window, choose a file, or paste rows from Excel. \
+                 Columns: container, SSL, size, type (headers optional).",
+            )
+            .color(MUTED),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let choose = Button::new(
+                RichText::new("Choose file…").color(Color32::from_rgb(22, 24, 28)),
+            )
+            .fill(ACCENT);
+            if ui.add(choose).clicked() {
+                action = Some(UploadAction::ChooseFile);
+            }
+            ui.label(RichText::new("or drop a .csv / .xlsx here").small().color(MUTED));
+        });
+        ui.add(
+            TextEdit::multiline(&mut desk.paste_text)
+                .desired_rows(3)
+                .desired_width(f32::INFINITY)
+                .hint_text("Paste rows here, e.g.  YMLU1234567  YML  40  HC"),
+        );
+        if ui
+            .add_enabled(!desk.paste_text.trim().is_empty(), Button::new("Add pasted list"))
+            .clicked()
+        {
+            action = Some(UploadAction::Paste);
+        }
+        if !desk.upload_warnings.is_empty() {
+            ui.add_space(4.0);
+            for warning in desk.upload_warnings.iter().take(12) {
+                ui.label(RichText::new(format!("⚠ {warning}")).small().color(DUAL));
+            }
+            if desk.upload_warnings.len() > 12 {
+                ui.label(
+                    RichText::new(format!("…and {} more", desk.upload_warnings.len() - 12))
+                        .small()
+                        .color(DUAL),
+                );
+            }
+        }
+
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("WHERE TO RETURN").small().strong().color(MUTED));
+            ui.label(RichText::new(shift.label()).small().color(MUTED));
+            let captured: Vec<String> = SCHEDULE_READERS
+                .iter()
+                .map(|id| {
+                    let name = terminal(id).map(|t| t.name).unwrap_or(id);
+                    match desk.last_capture.get(*id) {
+                        Some((_, at)) => format!("{name} {at}"),
+                        None => format!("{name} not yet"),
+                    }
+                })
+                .collect();
+            ui.label(
+                RichText::new(format!("Receiving captured: {}", captured.join(" · ")))
+                    .small()
+                    .color(MUTED),
+            );
+            let busy = desk.schedule_shot.is_some() || !desk.schedule_queue.is_empty();
+            if ui
+                .add_enabled(!busy, Button::new(if busy { "Capturing…" } else { "Capture receiving now" }))
+                .on_hover_text("Read ITS and TraPac public schedules into the receiving board. Also runs when a browser signs in.")
+                .clicked()
+            {
+                action = Some(UploadAction::Capture);
+            }
+        });
+
+        if boxes.is_empty() {
+            ui.label(RichText::new("No empties uploaded for this date.").color(MUTED));
+        } else {
+            let mut single = 0;
+            let mut dual = 0;
+            let mut none = 0;
+            egui::Grid::new("empties-grid")
+                .num_columns(4)
+                .striped(true)
+                .spacing(Vec2::new(14.0, 6.0))
+                .show(ui, |ui| {
+                    for head in ["Container", "SSL", "Size / type", "Return"] {
+                        ui.label(RichText::new(head).small().strong().color(MUTED));
+                    }
+                    ui.end_row();
+                    for item in &boxes {
+                        let options = return_options(item, &date, shift, &desk.receivings);
+                        ui.monospace(&item.container);
+                        ui.label(if item.line.is_empty() { "?" } else { &item.line });
+                        ui.label(item.size_label());
+                        if !options.single.is_empty() {
+                            single += 1;
+                            ui.label(
+                                RichText::new(format!("Single: {}", options.single.join(", ")))
+                                    .color(OPEN),
+                            );
+                        } else if !options.dual.is_empty() {
+                            dual += 1;
+                            ui.label(
+                                RichText::new(format!("Dual only: {}", options.dual.join(", ")))
+                                    .color(DUAL),
+                            );
+                        } else if item.board_size().is_none() {
+                            none += 1;
+                            ui.label(
+                                RichText::new("Special equipment — check by hand").color(MUTED),
+                            );
+                        } else {
+                            none += 1;
+                            let known = terminals().len() - options.unknown.len();
+                            ui.label(
+                                RichText::new(format!(
+                                    "No terminal receiving ({known} of {} terminals known)",
+                                    terminals().len()
+                                ))
+                                .color(REFUSAL),
+                            )
+                            .on_hover_text(format!(
+                                "Not receiving: {}\nNo information: {}",
+                                options.closed.join(", "),
+                                options.unknown.join(", ")
+                            ));
+                        }
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!(
+                    "{} empties · {single} single · {dual} dual only · {none} no known terminal",
+                    boxes.len()
+                ))
+                .strong(),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Copy return plan").clicked() {
+                    action = Some(UploadAction::CopyPlan);
+                }
+                if ui
+                    .button("Use as container check list")
+                    .on_hover_text("Put these containers in the list the APM/LBCT check uses")
+                    .clicked()
+                {
+                    action = Some(UploadAction::UseForChecks);
+                }
+            });
+        }
+
+        ui.add_space(14.0);
+        ui.label(RichText::new("UPLOADS FOR THIS DATE").small().strong().color(MUTED));
+        if day_uploads.is_empty() {
+            ui.label(RichText::new("None yet.").small().color(MUTED));
+        }
+        for upload in &day_uploads {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "{} · {} · {} empties",
+                    upload.uploaded_at,
+                    upload.source,
+                    upload.boxes.len()
+                ));
+                if ui.small_button("Remove").clicked() {
+                    action = Some(UploadAction::Remove(upload.id));
+                }
+            });
+        }
+        let other_days: std::collections::BTreeSet<&str> = desk
+            .uploads
+            .iter()
+            .filter(|u| u.date != date)
+            .map(|u| u.date.as_str())
+            .collect();
+        if !other_days.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "Other days with uploads: {} (use the date arrows)",
+                    other_days.into_iter().rev().take(10).collect::<Vec<_>>().join(", ")
+                ))
+                .small()
+                .color(MUTED),
+            );
+        }
+    });
+
+    match action {
+        Some(UploadAction::ChooseFile) => {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Empty lists", &["csv", "tsv", "txt", "xlsx", "xlsm", "xls", "ods"])
+                .pick_file()
+            {
+                desk.upload_file(&path);
+            }
+        }
+        Some(UploadAction::Paste) => desk.upload_pasted(),
+        Some(UploadAction::Remove(id)) => desk.remove_upload(id),
+        Some(UploadAction::UseForChecks) => {
+            desk.containers_text = boxes
+                .iter()
+                .map(|b| b.container.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            desk.persist();
+            desk.status = format!("{} containers set as the check list.", boxes.len());
+        }
+        Some(UploadAction::CopyPlan) => {
+            ui.ctx()
+                .copy_text(return_plan(&date, shift, &boxes, &desk.receivings));
+            desk.status = "Return plan copied.".to_string();
+        }
+        Some(UploadAction::Capture) => desk.capture_receiving(true),
+        None => {}
+    }
 }
 
 enum LoginAction {

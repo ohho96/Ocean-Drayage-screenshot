@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Check, Evidence, Receiving, Shift};
+use crate::model::{Check, Evidence, Receiving, Shift, Upload};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Saved {
@@ -23,6 +23,9 @@ pub struct Saved {
     pub containers: String,
     #[serde(default)]
     pub receivings: Vec<Receiving>,
+    /// Daily lists of empties the user uploaded, kept by date.
+    #[serde(default)]
+    pub uploads: Vec<Upload>,
 }
 
 impl Default for Saved {
@@ -35,6 +38,7 @@ impl Default for Saved {
             next_id: 1,
             containers: String::new(),
             receivings: Vec::new(),
+            uploads: Vec::new(),
         }
     }
 }

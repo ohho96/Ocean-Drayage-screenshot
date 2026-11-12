@@ -218,6 +218,131 @@ impl Terminal {
 
 }
 
+/// One empty container from a daily upload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmptyBox {
+    pub container: String,
+    /// Shipping line, as a name from LINES when recognised.
+    pub line: String,
+    /// "20", "40" or "45"; empty when unknown.
+    pub size: String,
+    /// "DV" (dry), "HC", "RF", "OT", "FR", "TK"; empty when unknown.
+    pub kind: String,
+}
+
+impl EmptyBox {
+    /// The receiving-board size this box returns as, if it is a standard box.
+    pub fn board_size(&self) -> Option<BoxSize> {
+        match (self.size.as_str(), self.kind.as_str()) {
+            ("20", "DV" | "") => Some(BoxSize::Twenty),
+            ("40", "DV" | "") => Some(BoxSize::Forty),
+            ("40", "HC") => Some(BoxSize::FortyHc),
+            ("45", "HC" | "DV" | "") => Some(BoxSize::FortyFive),
+            _ => None,
+        }
+    }
+
+    pub fn size_label(&self) -> String {
+        match (self.size.is_empty(), self.kind.is_empty()) {
+            (true, true) => "?".into(),
+            (false, true) => format!("{}'", self.size),
+            (true, false) => self.kind.clone(),
+            (false, false) => format!("{}' {}", self.size, self.kind),
+        }
+    }
+}
+
+/// One daily list of empties the user uploaded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Upload {
+    pub id: u64,
+    /// The day these empties need a return appointment.
+    pub date: String,
+    pub uploaded_at: String,
+    /// File name, or "pasted".
+    pub source: String,
+    pub boxes: Vec<EmptyBox>,
+}
+
+/// Every box for a date, last upload winning for a repeated container.
+pub fn boxes_for_day(uploads: &[Upload], date: &str) -> Vec<EmptyBox> {
+    let mut out: Vec<EmptyBox> = Vec::new();
+    for upload in uploads.iter().filter(|upload| upload.date == date) {
+        for item in &upload.boxes {
+            if let Some(existing) = out.iter_mut().find(|b| b.container == item.container) {
+                *existing = item.clone();
+            } else {
+                out.push(item.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Where one box can go back on a date and shift, from the receiving board.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReturnOptions {
+    pub single: Vec<&'static str>,
+    pub dual: Vec<&'static str>,
+    pub closed: Vec<&'static str>,
+    pub unknown: Vec<&'static str>,
+}
+
+pub fn return_options(item: &EmptyBox, date: &str, shift: Shift, rows: &[Receiving]) -> ReturnOptions {
+    let mut options = ReturnOptions::default();
+    let size = item.board_size();
+    for terminal in terminals() {
+        let found = size.and_then(|size| {
+            rows.iter().find(|row| {
+                row.date == date
+                    && row.shift == shift
+                    && row.terminal_id == terminal.id
+                    && row.size == size
+                    && row.line.eq_ignore_ascii_case(&item.line)
+            })
+        });
+        match found.map(|row| row.status) {
+            Some(ReceiveStatus::Receiving) => options.single.push(terminal.name),
+            Some(ReceiveStatus::DualOnly) => options.dual.push(terminal.name),
+            Some(ReceiveStatus::NotReceiving) => options.closed.push(terminal.name),
+            None => options.unknown.push(terminal.name),
+        }
+    }
+    options
+}
+
+/// Copyable plan: where each uploaded empty can return.
+pub fn return_plan(date: &str, shift: Shift, boxes: &[EmptyBox], rows: &[Receiving]) -> String {
+    let mut lines = vec![
+        "Empty return plan".to_string(),
+        format!("Date: {date}"),
+        format!("Shift: {}", shift.label()),
+        String::new(),
+    ];
+    for item in boxes {
+        let options = return_options(item, date, shift, rows);
+        let where_to = if !options.single.is_empty() {
+            format!("Single: {}", options.single.join(", "))
+        } else if !options.dual.is_empty() {
+            format!("Dual only: {}", options.dual.join(", "))
+        } else if item.board_size().is_none() {
+            "Special equipment, check by hand".to_string()
+        } else if options.closed.len() == terminals().len() {
+            "No terminal receiving".to_string()
+        } else {
+            "No terminal known to receive (check)".to_string()
+        };
+        lines.push(format!(
+            "{}  {}  {}  {}",
+            item.container,
+            item.line,
+            item.size_label(),
+            where_to
+        ));
+    }
+    lines.join("\n")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Receiving {
     pub id: u64,
@@ -501,6 +626,54 @@ const TERMINALS: [Terminal; 11] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn return_options_split_single_and_dual() {
+        let item = EmptyBox {
+            container: "YMLU1234567".into(),
+            line: "Yang Ming".into(),
+            size: "40".into(),
+            kind: "HC".into(),
+        };
+        let row = |terminal: &str, status| Receiving {
+            id: 1,
+            date: "2026-11-12".into(),
+            shift: Shift::First,
+            terminal_id: terminal.into(),
+            line: "yang ming".into(),
+            size: BoxSize::FortyHc,
+            status,
+            updated_at: String::new(),
+        };
+        let rows = vec![
+            row("its", ReceiveStatus::Receiving),
+            row("trapac", ReceiveStatus::DualOnly),
+            row("yti", ReceiveStatus::NotReceiving),
+        ];
+        let options = return_options(&item, "2026-11-12", Shift::First, &rows);
+        assert_eq!(options.single, vec!["ITS"]);
+        assert_eq!(options.dual.len(), 1);
+        assert_eq!(options.closed.len(), 1);
+        assert_eq!(options.unknown.len(), terminals().len() - 3);
+        assert!(return_options(&item, "2026-11-12", Shift::Second, &rows).single.is_empty());
+        let plan = return_plan("2026-11-12", Shift::First, &[item], &rows);
+        assert!(plan.contains("YMLU1234567  Yang Ming  40' HC  Single: ITS"));
+    }
+
+    #[test]
+    fn later_upload_wins_for_same_container() {
+        let a = EmptyBox { container: "A".into(), line: "ONE".into(), size: "20".into(), kind: "DV".into() };
+        let mut b = a.clone();
+        b.size = "40".into();
+        let uploads = vec![
+            Upload { id: 1, date: "d".into(), uploaded_at: String::new(), source: String::new(), boxes: vec![a] },
+            Upload { id: 2, date: "d".into(), uploaded_at: String::new(), source: String::new(), boxes: vec![b] },
+            Upload { id: 3, date: "other".into(), uploaded_at: String::new(), source: String::new(), boxes: vec![] },
+        ];
+        let day = boxes_for_day(&uploads, "d");
+        assert_eq!(day.len(), 1);
+        assert_eq!(day[0].size, "40");
+    }
 
     #[test]
     fn every_terminal_has_a_known_account() {

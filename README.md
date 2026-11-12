@@ -76,6 +76,50 @@ Only URL overrides are read, for example `TREMPOINT_URL`, `LBCT_LOGIN_URL`,
 `LBCT_URL`, `ITS_EMPTY_URL`, `TRAPAC_EMPTY_URL` and `YTI_EMPTY_URL`. If a key
 is missing, the built-in default URL is used. `.env` is gitignored.
 
+## Daily empties list
+
+Open the **Empties** screen each day and upload the empties that need a
+return appointment:
+
+- **How to upload:** drop a `.csv` or `.xlsx` file on the window, click
+  **Choose file…**, or paste rows straight from Excel.
+- **Columns:** container, SSL, size and type. Header names are recognised in
+  many spellings (`Container #`, `Cntr No`, `SSL`, `Line`, `SCAC`, `Size`,
+  `Sz/Tp`, `Type`…). Without a header, each cell is recognised by its content.
+  Title rows above the header are skipped.
+- **Accepted values:**
+  - SSL: a name, short code or SCAC (`Yang Ming`, `YML`, `YMLU`).
+  - Size and type: `40`, `40HC`, `40' HQ` or ISO codes (`22G1`, `45G1`,
+    `L5G1`, `45R1`). Type is DV, HC, RF, OT, FR or TK.
+- **Problems:** shown as warnings after the upload, for example an unknown
+  line, a missing size, or a container listed twice.
+- **History:** every upload is saved with the date, time and file name, and
+  kept by date in the desk state. Use the date arrows to see another day.
+  Uploading again on the same day adds to the list, and the latest row wins
+  for a repeated container.
+
+For each empty, the screen shows where it can go back on the selected shift,
+using the receiving board:
+
+- **Single:** terminals receiving that line and size as a straight drop.
+- **Dual only:** terminals that take it only on a dual transaction.
+- **No terminal receiving:** hover to see which terminals said no and which
+  have no information yet.
+
+**Copy return plan** copies the list as text. **Use as container check list**
+sends the containers to the APM/LBCT check.
+
+**Capturing what terminals receive:** when any browser signs in, the desk
+reads the ITS and TraPac public receiving schedules into the receiving board
+(at most every 30 minutes). Use **Capture receiving now** to refresh. Other
+terminals still go on the Receiving screen by hand for now:
+- APM's public page is gone (404).
+- YTI's page has no table.
+- ETS refuses automated requests.
+
+To read them automatically, open a signed-in browser on the page that shows
+receiving, and Claude can build a reader with the MCP server.
+
 ## Using the dashboard
 
 1. Enter the container, date and shift at the top. For a batch, put one
@@ -173,7 +217,7 @@ Page screenshots from `inspect_page` go to `screenshots/_inspect/`.
 |------|---------|
 | `desk_browser.py` | Shared engine: terminal URLs, page classification, APM and LBCT checks, dashboard file protocol, CLI runner |
 | `screenshot.py` | Public empty-schedule screenshots (`--json` output for the dashboard) |
-| `schedules.py` | Reads public schedule tables into receiving-board rows (ITS so far) |
+| `schedules.py` | Reads public schedule tables into receiving-board rows (ITS, TraPac) |
 | `APM.py`, `LBCT.py` | CLI wrappers around `desk_browser.run_cli` |
 | `mcp_server.py` | MCP server so Claude Code can inspect browsers and the desk (`.mcp.json`) |
 | `ssl_lookup.py` | Shipping line name ↔ SCAC code lookup |
@@ -182,6 +226,7 @@ Page screenshots from `inspect_page` go to `screenshots/_inspect/`.
 | `dashboard/src/main.rs` | UI |
 | `dashboard/src/store.rs` | Saved desk state |
 | `dashboard/src/credentials.rs` | Saved logins (owner-only files) |
+| `dashboard/src/upload.rs` | Reads daily empties lists (CSV, Excel, pasted) |
 
 ## Tests
 
