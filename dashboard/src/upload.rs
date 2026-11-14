@@ -19,8 +19,10 @@ pub struct Parsed {
 /// Shipping line aliases -> dashboard names (LINES).
 const LINE_ALIASES: &[(&str, &str)] = &[
     ("MAERSK", "Maersk"), ("MAEU", "Maersk"), ("MSK", "Maersk"), ("MAE", "Maersk"),
+    ("MSKU", "Maersk"), ("SEAU", "Maersk"), ("SUDU", "Maersk"), ("HAMBURG SUD", "Maersk"),
     ("MSC", "MSC"), ("MSCU", "MSC"), ("MEDITERRANEAN SHIPPING", "MSC"),
     ("CMA CGM", "CMA CGM"), ("CMA", "CMA CGM"), ("CMDU", "CMA CGM"), ("CMACGM", "CMA CGM"),
+    ("APLU", "CMA CGM"), ("APL", "CMA CGM"), ("ANNU", "CMA CGM"), ("ANL", "CMA CGM"),
     ("COSCO", "COSCO"), ("COSU", "COSCO"), ("COS", "COSCO"), ("OOCL", "COSCO"), ("OOLU", "COSCO"),
     ("EVERGREEN", "Evergreen"), ("EGLV", "Evergreen"), ("EMC", "Evergreen"), ("EGL", "Evergreen"),
     ("HAPAG-LLOYD", "Hapag-Lloyd"), ("HAPAG LLOYD", "Hapag-Lloyd"), ("HAPAG", "Hapag-Lloyd"),
@@ -34,6 +36,155 @@ const LINE_ALIASES: &[(&str, &str)] = &[
     ("SM LINE", "SM Line"), ("SMLM", "SM Line"), ("SML", "SM Line"),
     ("MATSON", "Matson"), ("MATS", "Matson"), ("MAT", "Matson"),
 ];
+
+/// The main SCAC code for each dashboard line name.
+const LINE_SCAC: &[(&str, &str)] = &[
+    ("Maersk", "MAEU"), ("MSC", "MSCU"), ("CMA CGM", "CMDU"), ("COSCO", "COSU"),
+    ("Evergreen", "EGLV"), ("Hapag-Lloyd", "HLCU"), ("ONE", "ONEY"), ("Yang Ming", "YMLU"),
+    ("HMM", "HDMU"), ("ZIM", "ZIMU"), ("Wan Hai", "WHLC"), ("PIL", "PCIU"),
+    ("SM Line", "SMLM"), ("Matson", "MATS"),
+];
+
+/// The SCAC shown next to a line name, e.g. "MSC" -> "MSCU".
+pub fn scac_for(line: &str) -> Option<&'static str> {
+    LINE_SCAC
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(line))
+        .map(|(_, scac)| *scac)
+}
+
+/// Read what the user typed for an SSL: a SCAC (3 or 4 letters, e.g. MSC,
+/// MSCU, ONEY) or a line name. Unknown codes are kept, upper-cased.
+pub fn resolve_line(raw: &str) -> (String, bool) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (String::new(), true);
+    }
+    match normalize_line(trimmed) {
+        Some(name) => (name.to_string(), true),
+        None => (trimmed.to_uppercase(), false),
+    }
+}
+
+/// One row read from the bulk box.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BulkRow {
+    pub item: EmptyBox,
+    /// The SSL text could not be matched to a known line.
+    pub unknown_line: bool,
+    /// The container appeared earlier in the same paste.
+    pub repeated: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Bulk {
+    pub rows: Vec<BulkRow>,
+    /// Text on a line that was not a container, SCAC, size or type.
+    pub skipped: Vec<String>,
+}
+
+/// Read many containers at once. Each line may hold one or more container
+/// numbers and, optionally, a SCAC or line name and a size/type that apply to
+/// the containers on that line ("MSCU1234567 MSCU 40HC", "ONEU1, ONEU2 ONE").
+/// Anything a line leaves out comes from `defaults`.
+pub fn parse_bulk(text: &str, defaults: &EmptyBox) -> Bulk {
+    let mut bulk = Bulk::default();
+    let (default_line, default_known) = resolve_line(&defaults.line);
+    for (index, raw) in text.lines().enumerate() {
+        let tokens: Vec<&str> = raw
+            .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '\t' | '|'))
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        let mut containers = Vec::new();
+        let mut rest = Vec::new();
+        for token in &tokens {
+            match as_container(token) {
+                Some(number) => containers.push(number),
+                None => rest.push(*token),
+            }
+        }
+        if containers.is_empty() {
+            bulk.skipped.push(format!("Line {}: no container number in \"{}\"", index + 1, raw.trim()));
+            continue;
+        }
+
+        let (mut line, mut known, mut size, mut kind) = (String::new(), true, String::new(), String::new());
+        let mut words = Vec::new();
+        for token in rest {
+            let (s, k) = parse_size_type(token);
+            if !s.is_empty() || !k.is_empty() {
+                if size.is_empty() {
+                    size = s;
+                }
+                if kind.is_empty() {
+                    kind = k;
+                }
+            } else if let Some(k) = parse_kind(token) {
+                if kind.is_empty() {
+                    kind = k.to_string();
+                }
+            } else {
+                words.push(token);
+            }
+        }
+        if !words.is_empty() {
+            // Try the words together first ("Yang Ming"), then one at a time.
+            let joined = words.join(" ");
+            if let Some(name) = normalize_line(&joined) {
+                line = name.to_string();
+            } else if let Some(name) = words.iter().find_map(|w| normalize_line(w)) {
+                line = name.to_string();
+                for word in words.iter().filter(|w| normalize_line(w).is_none()) {
+                    bulk.skipped.push(format!("Line {}: \"{word}\" not recognised", index + 1));
+                }
+            } else if words.len() == 1 && (3..=4).contains(&words[0].len()) && words[0].chars().all(|c| c.is_ascii_alphabetic()) {
+                // Looks like a SCAC we don't know yet: keep it.
+                line = words[0].to_uppercase();
+                known = false;
+            } else {
+                bulk.skipped.push(format!("Line {}: \"{joined}\" not recognised", index + 1));
+            }
+        }
+        if line.is_empty() {
+            line = default_line.clone();
+            known = default_known;
+        }
+        // The default type only goes with the default size: "ONEY 20" on a
+        // 40' HC default is a 20' dry, not a 20' high cube.
+        if size.is_empty() {
+            size = defaults.size.clone();
+            if kind.is_empty() {
+                kind = defaults.kind.clone();
+            }
+        }
+        if kind.is_empty() {
+            kind = match size.as_str() {
+                "20" | "40" => "DV".into(),
+                "45" => "HC".into(),
+                _ => String::new(),
+            };
+        }
+
+        for container in containers {
+            let mut item = EmptyBox { container, line: line.clone(), size: size.clone(), kind: kind.clone() };
+            if item.line.is_empty() {
+                // Fall back to the owner code: MSCU1234567 -> MSC.
+                if let Some(name) = normalize_line(&item.container[..4]) {
+                    item.line = name.to_string();
+                }
+            }
+            let repeated = bulk.rows.iter().any(|row| row.item.container == item.container);
+            if repeated {
+                bulk.rows.retain(|row| row.item.container != item.container);
+            }
+            bulk.rows.push(BulkRow { item, unknown_line: !known, repeated });
+        }
+    }
+    bulk
+}
 
 pub fn normalize_line(raw: &str) -> Option<&'static str> {
     let key = raw.trim().to_uppercase().replace(['.', ','], "");
@@ -344,6 +495,67 @@ pub fn parse_file(path: &Path) -> Result<Parsed, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn defaults(line: &str, size: &str, kind: &str) -> EmptyBox {
+        EmptyBox { container: String::new(), line: line.into(), size: size.into(), kind: kind.into() }
+    }
+
+    #[test]
+    fn bulk_applies_default_scac_size_and_type() {
+        let bulk = parse_bulk("MSCU1234567\nMSCU7654321, MSCU1112223", &defaults("MSCU", "40", "HC"));
+        assert_eq!(bulk.rows.len(), 3);
+        assert!(bulk.rows.iter().all(|r| r.item.line == "MSC" && r.item.size == "40" && r.item.kind == "HC"));
+        assert!(bulk.skipped.is_empty());
+    }
+
+    #[test]
+    fn bulk_line_values_override_defaults() {
+        let text = "ONEU1029384 ONEY 20\nHDMU2233445 HMM 45HC\nYMLU5544332 Yang Ming 40HQ\nZIMU7654321 zim 22R1";
+        let bulk = parse_bulk(text, &defaults("MSC", "40", ""));
+        let got: Vec<(&str, &str, &str)> = bulk
+            .rows
+            .iter()
+            .map(|r| (r.item.line.as_str(), r.item.size.as_str(), r.item.kind.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("ONE", "20", "DV"), ("HMM", "45", "HC"), ("Yang Ming", "40", "HC"), ("ZIM", "20", "RF")]
+        );
+    }
+
+    #[test]
+    fn bulk_three_letter_scac_and_unknown_codes() {
+        let bulk = parse_bulk("EGHU3344556 EGL 40\nABCU1234567 XYZQ 20\nhello", &defaults("", "", ""));
+        assert_eq!(bulk.rows[0].item.line, "Evergreen");
+        assert!(!bulk.rows[0].unknown_line);
+        assert_eq!(bulk.rows[1].item.line, "XYZQ");
+        assert!(bulk.rows[1].unknown_line);
+        assert_eq!(bulk.skipped.len(), 1, "the line with no container is reported");
+    }
+
+    #[test]
+    fn bulk_line_size_does_not_take_default_type() {
+        let bulk = parse_bulk("ONEU1029384 ONEY 20\nMSCU1234567 RF", &defaults("MSC", "40", "HC"));
+        assert_eq!((bulk.rows[0].item.size.as_str(), bulk.rows[0].item.kind.as_str()), ("20", "DV"));
+        assert_eq!((bulk.rows[1].item.size.as_str(), bulk.rows[1].item.kind.as_str()), ("40", "RF"));
+    }
+
+    #[test]
+    fn bulk_without_ssl_uses_owner_code_and_marks_repeats() {
+        let bulk = parse_bulk("MAEU1112223\nMAEU1112223 40", &defaults("", "", ""));
+        assert_eq!(bulk.rows.len(), 1);
+        assert_eq!(bulk.rows[0].item.line, "Maersk");
+        assert_eq!(bulk.rows[0].item.size, "40");
+        assert!(bulk.rows[0].repeated);
+    }
+
+    #[test]
+    fn scac_lookup_both_ways() {
+        assert_eq!(scac_for("Yang Ming"), Some("YMLU"));
+        assert_eq!(resolve_line("oney"), ("ONE".to_string(), true));
+        assert_eq!(resolve_line("APL"), ("CMA CGM".to_string(), true));
+        assert_eq!(resolve_line("qqqq"), ("QQQQ".to_string(), false));
+    }
 
     #[test]
     fn reads_csv_with_header() {

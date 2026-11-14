@@ -60,6 +60,15 @@ struct SessionFile {
     #[serde(default)]
     results: Vec<Shot>,
     #[serde(default)]
+    capture: String,
+    /// "after_sign_in" for the automatic screenshot, "manual" for Save page.
+    #[serde(default)]
+    capture_reason: String,
+    /// Why whole-screen evidence may fall short (Screen Recording off, clock
+    /// without the date); empty when fine.
+    #[serde(default)]
+    screen_note: String,
+    #[serde(default)]
     heartbeat: f64,
 }
 
@@ -105,6 +114,12 @@ pub struct BrowserSlot {
     pub tabs: Vec<Tab>,
     pub opened_at: f64,
     pub last_seen: f64,
+    /// Last page saved, by "Save page" or automatically after sign-in.
+    pub last_capture: String,
+    /// How many pages were saved automatically after a sign-in.
+    pub auto_captures: usize,
+    /// Warning about whole-screen evidence from the browser; empty when fine.
+    pub screen_note: String,
     status: String,
     login: String,
     session_id: String,
@@ -155,6 +170,8 @@ pub struct BrowserManager {
     pub slots: Vec<BrowserSlot>,
     notices: Vec<String>,
     newly_online: Vec<String>,
+    /// Ask each new browser to save the page after sign-in.
+    pub auto_capture: bool,
 }
 
 impl BrowserManager {
@@ -164,6 +181,7 @@ impl BrowserManager {
             slots: Vec::new(),
             notices: Vec::new(),
             newly_online: Vec::new(),
+            auto_capture: true,
         }
     }
 
@@ -213,12 +231,17 @@ impl BrowserManager {
             .try_clone()
             .map_err(|err| format!("Could not open browser log: {err}"))?;
 
-        let child = Command::new(&python)
+        let mut command = Command::new(&python);
+        command
             .arg(&script)
             .arg("--terminal")
             .arg(terminal_id)
             .arg("--session")
-            .arg(&session_id)
+            .arg(&session_id);
+        if self.auto_capture {
+            command.arg("--auto-capture");
+        }
+        let child = command
             .current_dir(&self.root)
             .env("DESK_CREDENTIALS_DIR", crate::credentials::credentials_dir())
             .stdin(Stdio::null())
@@ -234,6 +257,9 @@ impl BrowserManager {
             tabs: Vec::new(),
             opened_at: now_secs(),
             last_seen: 0.0,
+            last_capture: String::new(),
+            auto_captures: 0,
+            screen_note: String::new(),
             status: "starting".into(),
             login: String::new(),
             session_id,
@@ -267,6 +293,26 @@ impl BrowserManager {
                 "shift": shift.key(),
             }),
         )
+    }
+
+    /// Save the page the browser is on as a full-page screenshot.
+    pub fn capture(&mut self, terminal_id: &str) -> Result<(), String> {
+        self.write_command(terminal_id, serde_json::json!({ "action": "capture" }))
+    }
+
+    /// Turn the after-sign-in screenshot on or off, for new browsers and the
+    /// ones already open.
+    pub fn set_auto_capture(&mut self, on: bool) {
+        self.auto_capture = on;
+        let ids: Vec<String> = self
+            .slots
+            .iter()
+            .filter(|slot| !slot.closing)
+            .map(|slot| slot.terminal_id.clone())
+            .collect();
+        for id in ids {
+            let _ = self.write_command(&id, serde_json::json!({ "action": "auto_capture", "on": on }));
+        }
     }
 
     pub fn focus(&mut self, terminal_id: &str) -> Result<(), String> {
@@ -303,7 +349,21 @@ impl BrowserManager {
                 slot.url = file.url.clone();
                 slot.tabs = file.tabs.clone();
                 slot.last_seen = file.heartbeat;
+                slot.screen_note = file.screen_note.clone();
 
+                if !file.capture.is_empty() && file.capture != slot.last_capture {
+                    slot.last_capture = file.capture.clone();
+                    if file.capture_reason == "after_sign_in" {
+                        slot.auto_captures += 1;
+                        self.notices.push(format!(
+                            "{}: saved after sign-in to {}",
+                            slot.terminal_id.to_uppercase(),
+                            file.capture
+                        ));
+                    } else {
+                        self.notices.push(format!("Page saved to {}", file.capture));
+                    }
+                }
                 if file.rev != slot.last_rev {
                     slot.last_rev = file.rev;
                     if !file.results.is_empty() {
@@ -574,6 +634,9 @@ mod tests {
             tabs: Vec::new(),
             opened_at: 1000.0,
             last_seen,
+            last_capture: String::new(),
+            auto_captures: 0,
+            screen_note: String::new(),
             status: status.into(),
             login: login.into(),
             session_id: String::new(),

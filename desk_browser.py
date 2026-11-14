@@ -12,7 +12,22 @@ Two ways in:
   ("needs_login"), signed in ("online") or was signed in and is now asking
   again ("logged_out"). The dashboard writes commands to
   data/browsers/<terminal>.cmd.json: "check" (look up containers), "focus"
-  (bring the window to the front) and "close". mcp_server.py may also send
+  (bring the window to the front), "capture" (save the current page as a
+  screenshot of the whole screen with the browser's address bar and the
+  computer clock, plus the full page as <name>_page.png, both stamped with the
+  time taken (see ``screen_evidence``), e.g. a terminal's empty receiving page after sign-in),
+  "auto_capture" (turn the after-sign-in screenshot on or off) and "close".
+
+  With ``--auto-capture``, the page is saved automatically a few seconds
+  after each sign-in (also after signing in again when a session expired).
+  The dashboard then sends "check" with its check list on terminals that
+  have an automatic check (APM, LBCT); if that arrives before the delay is
+  up, the landing page is saved first. Every checked container gets a
+  screenshot, including ones where slots were offered.
+  Extra pages to save at the same time can be listed per terminal in .env as
+  ``<TERMINAL>_AUTO_CAPTURE_URLS`` (comma separated), e.g.
+  ``ITS_TMS_AUTO_CAPTURE_URLS=https://tms.itslb.com/tms2/Import/EmptyReturn``.
+  They open in a new tab of the same signed-in browser and are closed after. mcp_server.py may also send
   "inspect" (describe the current page for development); the answer goes to
   data/browsers/<terminal>.inspect.json and never includes field values. A container is screenshotted
   when the page does not clearly offer a return, and the outcome goes back in
@@ -59,7 +74,19 @@ TERMINALS = {
     "wbct": {"url_key": "WBCT_APPT_URL", "fallback": "https://voyagertrack.portsamerica.com/"},
     "ets": {"url_key": "ETS_APPT_URL", "fallback": "https://www.emodal.com/"},
     "trapac": {"url_key": "TRAPAC_APPT_URL", "fallback": "https://www.emodal.com/"},
-    "yti": {"url_key": "YTI_APPT_URL", "fallback": "https://yti.com/"},
+    # YTI has two sign-in systems; each opens in its own browser.
+    "yti_gatelink": {"url_key": "YTI_GATELINK_URL", "fallback": "https://cap.yti.com/logon"},
+    "yti_lynx": {"url_key": "YTI_LYNX_URL", "fallback": "https://lynx.yti.com/"},
+    "yti": {"url_key": "YTI_GATELINK_URL", "fallback": "https://cap.yti.com/logon"},
+    # One eModal browser for every terminal that books there (ETS, ITS, PCT,
+    # Pier A, TTI, TraPac); the user picks the terminal inside eModal. The
+    # per-terminal eModal ids below are kept for the CLI and old .env files.
+    "emodal": {"url_key": "EMODAL_URL", "fallback": "https://www.emodal.com/"},
+    # ITS and ETS: their own sites (receiving information) plus eModal (appointments).
+    "its_tms": {"url_key": "ITS_TMS_URL", "fallback": "https://tms.itslb.com/tms2/Account/Login"},
+    "its_emodal": {"url_key": "ITS_APPT_URL", "fallback": "https://www.emodal.com/"},
+    "etslink": {"url_key": "ETSLINK_URL", "fallback": "https://www.etslink.com/"},
+    "ets_emodal": {"url_key": "ETS_APPT_URL", "fallback": "https://www.emodal.com/"},
     "lbct": {"url_key": "LBCT_LOGIN_URL", "fallback": "https://portal.lbct.com/LoginWithUrl"},
     "tti": {"url_key": "TTI_APPT_URL", "fallback": "https://www.emodal.com/"},
     "its": {"url_key": "ITS_APPT_URL", "fallback": "https://www.emodal.com/"},
@@ -71,8 +98,9 @@ TERMINALS = {
 # dashboard/src/model.rs.
 PUBLIC_PAGES = {
     "apm": {
-        "url_key": "TERMINAL_URL",
-        "fallback": "https://www.apmterminals.com/en/los-angeles/empty-container-return",
+        # Not TERMINAL_URL: older .env files point that at APM's retired page.
+        "url_key": "APM_EMPTY_URL",
+        "fallback": "https://www.apmterminals.com/en/los-angeles/practical-information/empty-receivables-and-open-areas",
     },
     "ets": {"url_key": "ETS_EMPTY_URL", "fallback": "https://www.etslink.com/"},
     "trapac": {
@@ -82,6 +110,13 @@ PUBLIC_PAGES = {
     "yti": {
         "url_key": "YTI_EMPTY_URL",
         "fallback": "https://yti.com/terminal-schedules/empty-receiving-schedule/",
+    },
+    # TTI posts its MSC empty receiving table as a picture on the gate
+    # schedule page; the screenshot is cropped to the pictures ("focus").
+    "tti": {
+        "url_key": "TTI_EMPTY_URL",
+        "fallback": "https://www.totalterminals.com/gate-schedule",
+        "focus": "main img",
     },
     "its": {
         "url_key": "ITS_EMPTY_URL",
@@ -133,7 +168,11 @@ ACCOUNT_OF = {
     "lbct": "lbct",
     "fenix": "fenix",
     "wbct": "voyagertrack",
-    "yti": "yti",
+    "yti": "yti_gatelink",
+    "yti_gatelink": "yti_gatelink",
+    "yti_lynx": "yti_lynx",
+    "its_tms": "its_tms",
+    "etslink": "etslink",
 }
 ACCOUNT_NAMES = {
     "termpoint": "TERMPoint",
@@ -141,12 +180,20 @@ ACCOUNT_NAMES = {
     "emodal": "eModal",
     "fenix": "Fenix portal",
     "voyagertrack": "VoyagerTrack",
-    "yti": "YTI",
+    "yti_gatelink": "YTI Gate Link",
+    "yti_lynx": "YTI LYNX",
+    "its_tms": "ITS TMS",
+    "etslink": "ETSLink",
 }
 # Known sign-in fields: (ID field, password field).
 FILL_SELECTORS = {
     "apm": ('input[name="Login_Nm"]', 'input[name="Login_Pwd"]'),
     "lbct": ("input.loginBoxInputUser", "input.loginBoxInputPassword"),
+    "yti_gatelink": ("input#UserName", "input#Password"),
+    "yti": ("input#UserName", "input#Password"),
+    "yti_lynx": ("input#username", "input#password"),
+    "its_tms": ("input#UserName", "input#Password"),
+    "etslink": ('input[name="PI_LOGIN_ID"]', 'input[name="PI_PASSWORD"]'),
 }
 
 # Marks the ID and password fields of the first visible login form in a frame.
@@ -325,6 +372,15 @@ def write_inspect_answer(terminal_id: str, answer: dict) -> None:
 
 LOGIN_URL_HINTS = ("login", "signin", "sign-in", "sign_in", "/auth", "logon")
 PROBE_SECONDS = 3.0
+# Wait after a sign-in before the automatic screenshot, so the landing page
+# (often a redirect or two, then a dashboard that loads data) has settled.
+AUTO_CAPTURE_DELAY = 5.0
+
+
+def auto_capture_urls(terminal_id: str) -> list[str]:
+    """Extra pages to save after sign-in, from <TERMINAL>_AUTO_CAPTURE_URLS."""
+    raw = os.getenv(f"{terminal_id.upper()}_AUTO_CAPTURE_URLS", "")
+    return [url.strip() for url in raw.split(",") if url.strip().startswith(("http://", "https://"))]
 
 
 def login_state(page, terminal_id: str, start_url: str, seen_online: bool) -> str:
@@ -376,6 +432,14 @@ class Session:
         self.url = ""
         self.pending: list[dict] = []
         self.fill_key: tuple | None = None
+        self.last_capture = ""
+        # Why the last capture was taken: "manual" or "after_sign_in".
+        self.capture_reason = ""
+        self.auto_capture = False
+        # When the after-sign-in screenshot is due (time.time()), if pending.
+        self.auto_due: float | None = None
+        # Why whole-screen evidence may fall short (permission, clock); "" when fine.
+        self.screen_note = ""
 
     def publish(
         self,
@@ -405,6 +469,10 @@ class Session:
             "date": self.date,
             "shift": shift,
             "results": self.results,
+            "capture": self.last_capture,
+            "capture_reason": self.capture_reason,
+            "auto_capture": self.auto_capture,
+            "screen_note": self.screen_note,
             "heartbeat": time.time(),
         }
         BROWSERS.mkdir(parents=True, exist_ok=True)
@@ -425,6 +493,54 @@ class Session:
             return True
         self.pending.append(command)
         return False
+
+    def capture(self, page, reason: str = "manual", label: str = "page") -> bool:
+        """Save the page the user is on (full page) and report the file."""
+        folder = SHOTS / self.terminal_id
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        try:
+            _saved, whole = screen_evidence(page, path, self.terminal_id)
+        except Exception as exc:
+            self.publish(message=f"Could not save the page: {str(exc).splitlines()[0]}")
+            return False
+        if not whole:
+            self.screen_note = SCREEN_BLOCKED
+        self.last_capture = str(path)
+        self.capture_reason = reason
+        what = "Saved after sign-in" if reason == "after_sign_in" else "Page saved"
+        self.publish(message=f"{what}: {path.name}", bump=True)
+        return True
+
+    def capture_after_sign_in(self, context, current) -> None:
+        """The automatic screenshot: the landing page, then any extra pages."""
+        self.auto_due = None
+        if self.login != "online":
+            return
+        settle(current)
+        saved = 1 if self.capture(current, "after_sign_in", "after_sign_in") else 0
+        for index, url in enumerate(auto_capture_urls(self.terminal_id), start=1):
+            extra = None
+            try:
+                extra = context.new_page()
+                extra.goto(url, wait_until="domcontentloaded", timeout=45000)
+                settle(extra)
+                if login_state(extra, self.terminal_id, "", True) != "online":
+                    self.publish(message=f"Not saved: {url} asked for a sign-in.")
+                    continue
+                if self.capture(extra, "after_sign_in", f"after_sign_in_{index}"):
+                    saved += 1
+            except Exception as exc:
+                self.publish(message=f"Could not open {url}: {str(exc).splitlines()[0]}")
+            finally:
+                if extra is not None:
+                    try:
+                        extra.close()
+                    except Exception:
+                        pass
+        if saved:
+            pages = "page" if saved == 1 else "pages"
+            self.publish(message=f"Signed in. Saved {saved} {pages} to screenshots/{self.terminal_id}.")
 
     def try_fill(self, page) -> None:
         """Fill the saved login once per sign-in page load."""
@@ -452,7 +568,11 @@ class Session:
             self.login = "online"
             if previous != "online":
                 self.message = "Signed in."
+                if self.auto_capture:
+                    self.auto_due = time.time() + AUTO_CAPTURE_DELAY
+                    self.message = "Signed in. Saving the page in a few seconds."
         elif self.seen_online:
+            self.auto_due = None
             self.login = "logged_out"
             if previous != "logged_out":
                 self.message = "Signed out (session expired?). Sign in again in the browser window."
@@ -512,10 +632,192 @@ def save_shot(page, terminal_id: str, container: str, finding: str = "no_return"
     folder = SHOTS / terminal_id
     folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    label = "check" if finding == "could_not_check" else "no_return"
+    label = {"could_not_check": "check", "open": "open"}.get(finding, "no_return")
     path = folder / f"{container}_{label}_{stamp}.png"
-    page.screenshot(path=str(path), full_page=True)
-    return str(path)
+    saved, _whole = screen_evidence(page, path, terminal_id, container)
+    return saved
+
+
+# ---- Evidence stamp ---------------------------------------------------------
+# Shipping lines and terminals want the date and time on the evidence itself,
+# so every screenshot gets a banner across the top: when it was taken (local
+# time with the UTC offset), which terminal, which container, and the page
+# address (without its query string, which can hold session ids).
+
+STAMP_FONTS = (
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+)
+
+
+def stamp_time(taken: datetime) -> str:
+    """e.g. 2026-11-14 14:29:24 PST (UTC-08:00)"""
+    zone = taken.tzname() or ""
+    offset = taken.strftime("%z")
+    offset = f"UTC{offset[:3]}:{offset[3:]}" if offset else ""
+    return " ".join(part for part in (taken.strftime("%Y-%m-%d %H:%M:%S"), zone, f"({offset})" if offset else "") if part)
+
+
+def page_address(url: str) -> str:
+    address = (url or "").split("?", 1)[0].split("#", 1)[0]
+    return address if len(address) <= 140 else address[:137] + "..."
+
+
+def stamp_lines(terminal_id: str, url: str, taken: datetime, container: str = "") -> list[str]:
+    first = f"Taken {stamp_time(taken)}"
+    second = [terminal_id.replace("_", " ").upper()]
+    if container:
+        second.append(f"Container {container}")
+    address = page_address(url)
+    if address:
+        second.append(address)
+    return [first, "  ·  ".join(second)]
+
+
+def _stamp_font(size: int):
+    from PIL import ImageFont
+
+    for path in STAMP_FONTS:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def stamp_image(path, lines: list[str]) -> bool:
+    """Add a banner with `lines` above the image at `path`. False if Pillow is missing."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return False
+    with Image.open(path) as source:
+        image = source.convert("RGB")
+    width = image.width
+    size = max(15, min(26, width // 60))
+    font = _stamp_font(size)
+    pad = size // 2 + 4
+    line_height = size + size // 3
+    banner = pad * 2 + line_height * len(lines)
+    out = Image.new("RGB", (width, image.height + banner), (20, 24, 31))
+    out.paste(image, (0, banner))
+    draw = ImageDraw.Draw(out)
+    for index, text in enumerate(lines):
+        colour = (255, 214, 102) if index == 0 else (235, 238, 243)
+        draw.text((pad, pad + index * line_height), text, fill=colour, font=font)
+    out.save(path)
+    return True
+
+
+def evidence_shot(page, path, terminal_id: str, container: str = "", full_page: bool = True, clip=None) -> datetime:
+    """Screenshot the page to `path` and stamp the time on it. Returns the time taken."""
+    taken = datetime.now().astimezone()
+    options = {"path": str(path), "full_page": full_page}
+    if clip:
+        options["clip"] = clip
+    page.screenshot(**options)
+    try:
+        stamp_image(path, stamp_lines(terminal_id, page.url, taken, container))
+    except Exception:
+        pass  # Keep the plain screenshot; the file name still carries the time.
+    return taken
+
+
+# ---- Whole-screen evidence ----------------------------------------------------
+# MSC and ONE want the *entire screen*: the browser's address bar, the page,
+# and the computer's own clock with the date. A page screenshot shows none of
+# the browser or the clock, so terminal browsers bring their window to the
+# front and grab every display as it looks (``screen_evidence``). The full
+# page is kept next to it as <name>_page.png for anything below the fold.
+
+def screen_capture_allowed() -> bool | None:
+    """macOS Screen Recording permission for this app; None when unknown (not macOS)."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+
+        graphics = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        graphics.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+        return bool(graphics.CGPreflightScreenCaptureAccess())
+    except Exception:
+        return None
+
+
+SCREEN_BLOCKED = (
+    "Whole-screen screenshots are blocked: allow Screen Recording for the app that "
+    "started the dashboard (System Settings > Privacy & Security > Screen & System "
+    "Audio Recording), then restart it. Saving the page only until then."
+)
+
+
+def clock_warning() -> str:
+    """The menu bar clock must show the date for carrier evidence (macOS)."""
+    if sys.platform != "darwin":
+        return ""
+    import subprocess
+
+    def read(domain: str, key: str) -> str:
+        try:
+            done = subprocess.run(["defaults", "read", domain, key], capture_output=True, text=True, timeout=5)
+        except Exception:
+            return ""
+        return done.stdout.strip() if done.returncode == 0 else ""
+
+    if read("NSGlobalDomain", "_HIHideMenuBar") == "1":
+        return "The menu bar is set to hide, so the clock may be missing from screenshots. Turn off automatically hiding the menu bar (System Settings > Control Center)."
+    # ShowDate: 0 = when space allows, 1 = always, 2 = never.
+    if read("com.apple.menuextra.clock", "ShowDate") not in ("1", ""):
+        return "Set the menu bar clock to always show the date (System Settings > Control Center > Clock Options > Show date: Always), so every screenshot shows the date."
+    return ""
+
+
+def grab_screen(page, path) -> bool:
+    """Bring the page's window forward and save every display as it looks. False if not possible."""
+    if screen_capture_allowed() is False:
+        return False
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        return False
+    try:
+        page.bring_to_front()
+        page.wait_for_timeout(700)  # let the window come forward and repaint
+        image = ImageGrab.grab(all_screens=True)
+    except Exception:
+        return False
+    if image is None or image.width < 200:
+        return False
+    image.save(path)
+    return True
+
+
+def screen_evidence(page, path, terminal_id: str, container: str = "") -> tuple[str, bool]:
+    """Evidence from a terminal browser: the whole screen at `path` (stamped), and
+    the full page at <name>_page.png. Without screen access, the full page goes
+    to `path`. Returns (path saved, whether the whole screen was captured)."""
+    path = Path(path)
+    taken = datetime.now().astimezone()
+    lines = stamp_lines(terminal_id, page.url, taken, container)
+    if grab_screen(page, path):
+        try:
+            stamp_image(path, lines)
+        except Exception:
+            pass
+        page_path = path.with_name(f"{path.stem}_page{path.suffix}")
+        try:
+            evidence_shot(page, page_path, terminal_id, container)
+        except Exception:
+            pass  # The whole-screen file is the evidence; the page copy is extra.
+        return str(path), True
+    evidence_shot(page, path, terminal_id, container)
+    return str(path), False
 
 
 def pop_command(path: Path) -> dict | None:
@@ -649,11 +951,16 @@ def _one_apm(page, container: str) -> dict:
             "No empty-return appointment slots were offered.",
         )
     shown = ", ".join(labels[:6])
+    # Keep a picture of the offered slots too (the slot list is open).
+    try:
+        screenshot = save_shot(page, "apm", container, "open")
+    except Exception:
+        screenshot = ""
     return {
         "container": container,
         "finding": "open",
         "note": f"Slots offered: {shown}",
-        "screenshot": "",
+        "screenshot": screenshot,
     }
 
 
@@ -732,8 +1039,10 @@ def run_checks(page, terminal_id: str, containers: list[str], session) -> str:
     return "done"
 
 
-def serve(terminal_id: str, session_id: str) -> int:
+def serve(terminal_id: str, session_id: str, auto_capture: bool = False) -> int:
     session = Session(session_id, terminal_id)
+    session.auto_capture = auto_capture
+    session.screen_note = SCREEN_BLOCKED if screen_capture_allowed() is False else clock_warning()
     try:
         session.command_path.unlink(missing_ok=True)
     except OSError:
@@ -784,6 +1093,14 @@ def serve(terminal_id: str, session_id: str) -> int:
                     except Exception as exc:
                         answer = {"request_id": command.get("request_id"), "error": str(exc).splitlines()[0]}
                     write_inspect_answer(terminal_id, answer)
+                if action == "capture":
+                    session.capture(current)
+                if action == "auto_capture":
+                    session.auto_capture = bool(command.get("on"))
+                    if not session.auto_capture:
+                        session.auto_due = None
+                    state = "on" if session.auto_capture else "off"
+                    session.publish(message=f"Screenshot after sign-in is {state}.")
                 if action == "focus":
                     try:
                         current.bring_to_front()
@@ -798,9 +1115,25 @@ def serve(terminal_id: str, session_id: str) -> int:
                     if not containers:
                         session.publish(message="Enter at least one container to check.")
                     else:
+                        if session.auto_due is not None:
+                            # Just signed in: save the landing page before the
+                            # check navigates away from it.
+                            try:
+                                session.capture_after_sign_in(context, current)
+                            except Exception as exc:
+                                session.auto_due = None
+                                session.publish(message=f"Could not save the page: {str(exc).splitlines()[0]}")
                         outcome = run_checks(current, terminal_id, containers, session)
                         if outcome == "closed":
                             break
+                    last_probe = 0.0
+
+                if session.auto_due is not None and time.time() >= session.auto_due:
+                    try:
+                        session.capture_after_sign_in(context, current)
+                    except Exception as exc:
+                        session.auto_due = None
+                        session.publish(message=f"Could not save the page: {str(exc).splitlines()[0]}")
                     last_probe = 0.0
 
                 if time.time() - last_probe >= PROBE_SECONDS:
@@ -886,6 +1219,57 @@ def _self_test() -> None:
         finding, _note = classify_page(text)
         assert finding == expected, (text, finding)
 
+    from datetime import timedelta, timezone
+
+    taken = datetime(2026, 11, 14, 14, 29, 24, tzinfo=timezone(timedelta(hours=-8), "PST"))
+    lines = stamp_lines("its_tms", "https://tms.itslb.com/x?session=secret#top", taken, "MSCU1234567")
+    assert lines[0] == "Taken 2026-11-14 14:29:24 PST (UTC-08:00)", lines
+    assert "secret" not in lines[1] and "ITS TMS" in lines[1] and "MSCU1234567" in lines[1], lines
+    try:
+        from PIL import Image
+    except ImportError:
+        Image = None
+    if Image is not None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            shot = Path(folder) / "shot.png"
+            Image.new("RGB", (800, 300), (255, 255, 255)).save(shot)
+            assert stamp_image(shot, lines)
+            with Image.open(shot) as stamped:
+                assert stamped.width == 800 and stamped.height > 300
+
+    assert SCREEN_BLOCKED.startswith("Whole-screen screenshots are blocked")
+    assert isinstance(clock_warning(), str)
+
+    os.environ["SELFTEST_AUTO_CAPTURE_URLS"] = " https://a.example/x , ftp://no, ,https://b.example/y"
+    assert auto_capture_urls("selftest") == ["https://a.example/x", "https://b.example/y"]
+    del os.environ["SELFTEST_AUTO_CAPTURE_URLS"]
+
+    # A sign-in arms the automatic screenshot; signing out cancels it.
+    class FakePage:
+        def __init__(self, url, password):
+            self.url, self._password = url, password
+
+        def locator(self, selector):
+            count = 1 if (self._password and "password" in selector) else 0
+            return type("L", (), {"count": lambda _self: count})()
+
+        def title(self):
+            return ""
+
+    session = Session("test", "fenix")
+    session.publish = lambda *a, **k: None
+    session.try_fill = lambda page: None
+    session.start_url = "https://portal.example/login"
+    session.auto_capture = True
+    session.probe([], FakePage("https://portal.example/login", True))
+    assert session.auto_due is None and session.login == "needs_login"
+    session.probe([], FakePage("https://portal.example/home", False))
+    assert session.login == "online" and session.auto_due is not None
+    session.probe([], FakePage("https://portal.example/login", True))
+    assert session.login == "logged_out" and session.auto_due is None
+
 
 def main() -> int:
     load_dotenv(ROOT / ".env")
@@ -893,6 +1277,11 @@ def main() -> int:
     parser.add_argument("--terminal", choices=sorted(TERMINALS))
     parser.add_argument("--session", default="")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--auto-capture",
+        action="store_true",
+        help="Save a full-page screenshot a few seconds after each sign-in",
+    )
     args = parser.parse_args()
     if args.self_test:
         _self_test()
@@ -901,7 +1290,7 @@ def main() -> int:
     if not args.terminal or not args.session:
         parser.error("--terminal and --session are required")
     try:
-        return serve(args.terminal, args.session)
+        return serve(args.terminal, args.session, auto_capture=args.auto_capture)
     except KeyboardInterrupt:
         return 0
 

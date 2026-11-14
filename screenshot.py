@@ -20,7 +20,7 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 
-from desk_browser import PUBLIC_PAGES, ROOT, SHOTS, env_url
+from desk_browser import PUBLIC_PAGES, ROOT, SHOTS, env_url, evidence_shot
 from schedules import read_schedule
 
 
@@ -31,12 +31,57 @@ def snap_public(page, terminal_id: str, output_dir=SHOTS, full_page: bool = True
         page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         page.wait_for_timeout(1500)
+    load_images(page)
     folder = output_dir / terminal_id
     folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = folder / f"schedule_{stamp}.png"
-    page.screenshot(path=str(path), full_page=full_page)
+    clip = focus_clip(page, PUBLIC_PAGES[terminal_id].get("focus"))
+    # Stamped with the time taken, terminal and address (desk_browser.evidence_shot).
+    evidence_shot(page, path, terminal_id, full_page=bool(clip) or full_page, clip=clip)
     return str(path)
+
+
+# Lazy images only load when scrolled into view, so a full-page screenshot
+# can show empty boxes. Load them all and wait (a few seconds at most).
+LOAD_IMAGES_JS = """async () => {
+    const images = [...document.images];
+    images.forEach(img => { img.loading = 'eager'; });
+    await Promise.race([
+        Promise.all(images.map(img => img.decode().catch(() => null))),
+        new Promise(done => setTimeout(done, 8000)),
+    ]);
+}"""
+
+FOCUS_JS = """(selector) => {
+    const boxes = [...document.querySelectorAll(selector)]
+        .map(el => el.getBoundingClientRect())
+        .filter(r => r.width > 50 && r.height > 50);
+    if (!boxes.length) return null;
+    const pad = 12;
+    const left = Math.max(0, Math.min(...boxes.map(r => r.left)) + scrollX - pad);
+    const top = Math.max(0, Math.min(...boxes.map(r => r.top)) + scrollY - pad);
+    const right = Math.max(...boxes.map(r => r.right)) + scrollX + pad;
+    const bottom = Math.max(...boxes.map(r => r.bottom)) + scrollY + pad;
+    return {x: left, y: top, width: right - left, height: bottom - top};
+}"""
+
+
+def load_images(page) -> None:
+    try:
+        page.evaluate(LOAD_IMAGES_JS)
+    except Exception:
+        page.wait_for_timeout(1500)
+
+
+def focus_clip(page, selector: str | None) -> dict | None:
+    """The area around the elements that hold the schedule, or None for the whole page."""
+    if not selector:
+        return None
+    try:
+        return page.evaluate(FOCUS_JS, selector)
+    except Exception:
+        return None
 
 
 def main() -> int:

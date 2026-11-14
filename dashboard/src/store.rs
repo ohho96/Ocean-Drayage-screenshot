@@ -26,6 +26,20 @@ pub struct Saved {
     /// Daily lists of empties the user uploaded, kept by date.
     #[serde(default)]
     pub uploads: Vec<Upload>,
+    /// Save a screenshot of each terminal page right after the user signs in.
+    #[serde(default = "default_true")]
+    pub auto_capture: bool,
+    /// Where each shipping line takes its empties back (line in capitals ->
+    /// terminal ids), as the carrier lists them. Disputes need proof at all.
+    #[serde(default)]
+    pub return_locations: HashMap<String, Vec<String>>,
+    /// B/L, invoice number and invoice date per container.
+    #[serde(default)]
+    pub disputes: HashMap<String, crate::proof::Dispute>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Saved {
@@ -39,6 +53,9 @@ impl Default for Saved {
             containers: String::new(),
             receivings: Vec::new(),
             uploads: Vec::new(),
+            auto_capture: true,
+            return_locations: HashMap::new(),
+            disputes: HashMap::new(),
         }
     }
 }
