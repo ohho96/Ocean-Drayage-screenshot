@@ -178,14 +178,110 @@ pub struct Terminal {
 
 /// Login systems. Several terminals share one (eModal). Keep in step with
 /// ACCOUNT_OF in desk_browser.py.
-pub const ACCOUNTS: [(&str, &str); 6] = [
+pub const ACCOUNTS: [(&str, &str); 9] = [
     ("termpoint", "TERMPoint"),
     ("lbct", "LBCT portal"),
     ("emodal", "eModal"),
     ("fenix", "Fenix portal"),
     ("voyagertrack", "VoyagerTrack"),
-    ("yti", "YTI"),
+    ("yti_gatelink", "YTI Gate Link"),
+    ("yti_lynx", "YTI LYNX"),
+    ("its_tms", "ITS TMS"),
+    ("etslink", "ETSLink"),
 ];
+
+/// Browser id of the eModal window. eModal is one website for several
+/// terminals (picked in its terminal list), so they all share one browser.
+pub const EMODAL: &str = "emodal";
+
+/// One sign-in system a terminal uses. Each website gets one browser; `id` is
+/// the browser id (the terminal id when the terminal has a single portal of
+/// its own, `EMODAL` for every terminal that books on eModal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Portal {
+    pub id: &'static str,
+    pub terminal_id: &'static str,
+    pub name: &'static str,
+    pub url: &'static str,
+    pub account: &'static str,
+}
+
+/// Terminals with more than one portal. Keep in step with TERMINALS in desk_browser.py.
+const EXTRA_PORTALS: &[Portal] = &[
+    Portal {
+        id: "yti_gatelink",
+        terminal_id: "yti",
+        name: "Gate Link",
+        url: "https://cap.yti.com/logon",
+        account: "yti_gatelink",
+    },
+    Portal {
+        id: "yti_lynx",
+        terminal_id: "yti",
+        name: "LYNX",
+        url: "https://lynx.yti.com/",
+        account: "yti_lynx",
+    },
+    Portal {
+        id: "its_tms",
+        terminal_id: "its",
+        name: "ITS TMS",
+        url: "https://tms.itslb.com/tms2/Account/Login",
+        account: "its_tms",
+    },
+    Portal {
+        id: EMODAL,
+        terminal_id: "its",
+        name: "eModal",
+        url: "https://www.emodal.com/",
+        account: "emodal",
+    },
+    Portal {
+        id: "etslink",
+        terminal_id: "ets",
+        name: "ETSLink",
+        url: "https://www.etslink.com/",
+        account: "etslink",
+    },
+    Portal {
+        id: EMODAL,
+        terminal_id: "ets",
+        name: "eModal",
+        url: "https://www.emodal.com/",
+        account: "emodal",
+    },
+];
+
+/// Terminals that book appointments on eModal, in board order.
+pub fn emodal_terminals() -> Vec<&'static Terminal> {
+    terminals()
+        .iter()
+        .filter(|terminal| terminal.portals().iter().any(|p| p.id == EMODAL))
+        .collect()
+}
+
+/// Name for a browser window: the terminal (and portal), or for the shared
+/// eModal window every terminal it serves.
+pub fn browser_name(id: &str) -> String {
+    if id == EMODAL {
+        let names: Vec<&str> = emodal_terminals().iter().map(|t| t.name).collect();
+        return format!("eModal ({})", names.join(", "));
+    }
+    match portal(id) {
+        Some((t, p)) if t.portals().len() > 1 => format!("{} — {}", t.name, p.name),
+        Some((t, _)) => t.name.to_string(),
+        None => "Terminal".to_string(),
+    }
+}
+
+/// The terminal and portal behind a browser id. For the shared eModal
+/// browser this is the first eModal terminal; use `browser_name` for labels.
+pub fn portal(id: &str) -> Option<(&'static Terminal, Portal)> {
+    terminals()
+        .iter()
+        .flat_map(|terminal| terminal.portals().into_iter().map(move |p| (terminal, p)))
+        .find(|(_, p)| p.id == id)
+}
 
 pub fn account_name(account: &str) -> &'static str {
     ACCOUNTS
@@ -203,9 +299,29 @@ impl Terminal {
             "lbct" => "lbct",
             "fenix" => "fenix",
             "wbct" => "voyagertrack",
-            "yti" => "yti",
+            "yti" => "yti_gatelink",
             _ => "emodal",
         }
+    }
+
+    /// Sign-in systems for this terminal, appointment system first.
+    pub fn portals(&self) -> Vec<Portal> {
+        let extra: Vec<Portal> = EXTRA_PORTALS
+            .iter()
+            .copied()
+            .filter(|p| p.terminal_id == self.id)
+            .collect();
+        if !extra.is_empty() {
+            return extra;
+        }
+        let account = self.account();
+        vec![Portal {
+            id: if account == "emodal" { EMODAL } else { self.id },
+            terminal_id: self.id,
+            name: self.appt_system,
+            url: self.appt_url,
+            account,
+        }]
     }
 
     pub fn where_to_look(&self) -> &'static str {
@@ -219,7 +335,7 @@ impl Terminal {
 }
 
 /// One empty container from a daily upload.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmptyBox {
     pub container: String,
     /// Shipping line, as a name from LINES when recognised.
@@ -277,6 +393,75 @@ pub fn boxes_for_day(uploads: &[Upload], date: &str) -> Vec<EmptyBox> {
         }
     }
     out
+}
+
+/// Source name for containers typed in on the Empties screen.
+pub const MANUAL_SOURCE: &str = "added by hand";
+
+/// Container sizes the desk tracks, in feet.
+pub const BOX_SIZES: [&str; 3] = ["20", "40", "45"];
+
+/// Container types: code and a plain name.
+pub const BOX_KINDS: [(&str, &str); 6] = [
+    ("DV", "Dry"),
+    ("HC", "High cube"),
+    ("RF", "Reefer"),
+    ("OT", "Open top"),
+    ("FR", "Flat rack"),
+    ("TK", "Tank"),
+];
+
+/// Add a box to a date's list, or update it everywhere it already appears
+/// (so the "last upload wins" view stays consistent). New boxes go into the
+/// date's hand-entered list, which is created on first use. Returns true when
+/// the container was new for that date.
+pub fn upsert_box(
+    uploads: &mut Vec<Upload>,
+    date: &str,
+    item: EmptyBox,
+    next_id: &mut u64,
+    now: &str,
+) -> bool {
+    let mut found = false;
+    for upload in uploads.iter_mut().filter(|upload| upload.date == date) {
+        for existing in upload.boxes.iter_mut().filter(|b| b.container == item.container) {
+            *existing = item.clone();
+            found = true;
+        }
+    }
+    if found {
+        return false;
+    }
+    if let Some(manual) = uploads
+        .iter_mut()
+        .find(|upload| upload.date == date && upload.source == MANUAL_SOURCE)
+    {
+        manual.boxes.push(item);
+        manual.uploaded_at = now.to_string();
+    } else {
+        uploads.push(Upload {
+            id: *next_id,
+            date: date.to_string(),
+            uploaded_at: now.to_string(),
+            source: MANUAL_SOURCE.to_string(),
+            boxes: vec![item],
+        });
+        *next_id += 1;
+    }
+    true
+}
+
+/// Remove a container from every list for a date, dropping lists left empty.
+/// Returns how many entries were removed.
+pub fn remove_box(uploads: &mut Vec<Upload>, date: &str, container: &str) -> usize {
+    let mut removed = 0;
+    for upload in uploads.iter_mut().filter(|upload| upload.date == date) {
+        let before = upload.boxes.len();
+        upload.boxes.retain(|b| b.container != container);
+        removed += before - upload.boxes.len();
+    }
+    uploads.retain(|upload| upload.date != date || !upload.boxes.is_empty());
+    removed
 }
 
 /// Where one box can go back on a date and shift, from the receiving board.
@@ -375,6 +560,20 @@ pub fn check_key(date: &str, shift: Shift, container: &str, terminal_id: &str) -
     )
 }
 
+/// When a screenshot was saved, from the file itself, in local time with the
+/// UTC offset (the same time is stamped on the image). `None` if the file is gone.
+pub fn screenshot_taken(path: &str) -> Option<String> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(format_taken(chrono::DateTime::<chrono::Local>::from(modified)))
+}
+
+fn format_taken<Tz: chrono::TimeZone>(at: chrono::DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    at.format("%Y-%m-%d %H:%M:%S (UTC%:z)").to_string()
+}
+
 pub fn proof_packet(
     container: &str,
     date: &str,
@@ -416,6 +615,9 @@ pub fn proof_packet(
         }
         if !check.screenshot.trim().is_empty() {
             lines.push(format!("Screenshot: {}", check.screenshot.trim()));
+            if let Some(taken) = screenshot_taken(check.screenshot.trim()) {
+                lines.push(format!("Screenshot taken: {taken}"));
+            }
         }
         if let Some(url) = terminal.empty_url {
             lines.push(format!("Schedule: {url}"));
@@ -516,7 +718,7 @@ const TERMINALS: [Terminal; 11] = [
         name: "APM Terminals",
         port: Port::LosAngeles,
         pier: "Pier 400",
-        empty_url: Some("https://www.apmterminals.com/en/los-angeles/empty-container-return"),
+        empty_url: Some("https://www.apmterminals.com/en/los-angeles/practical-information/empty-receivables-and-open-areas"),
         appt_url: "https://termpoint.apmterminals.com/",
         appt_system: "TERMPoint",
         auto_check: true,
@@ -567,8 +769,8 @@ const TERMINALS: [Terminal; 11] = [
         port: Port::LosAngeles,
         pier: "Berths 212–223",
         empty_url: Some("https://yti.com/terminal-schedules/empty-receiving-schedule/"),
-        appt_url: "https://yti.com/",
-        appt_system: "YTI",
+        appt_url: "https://cap.yti.com/logon",
+        appt_system: "Gate Link / LYNX",
         auto_check: false,
     },
     Terminal {
@@ -586,7 +788,7 @@ const TERMINALS: [Terminal; 11] = [
         name: "TTI",
         port: Port::LongBeach,
         pier: "Pier T",
-        empty_url: None,
+        empty_url: Some("https://www.totalterminals.com/gate-schedule"),
         appt_url: "https://www.emodal.com/",
         appt_system: "eModal",
         auto_check: false,
@@ -625,6 +827,59 @@ const TERMINALS: [Terminal; 11] = [
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn screenshot_time_shows_offset_and_missing_file_is_none() {
+        use chrono::TimeZone;
+        let zone = chrono::FixedOffset::west_opt(8 * 3600).unwrap();
+        let at = zone.with_ymd_and_hms(2026, 11, 14, 14, 29, 24).unwrap();
+        assert_eq!(super::format_taken(at), "2026-11-14 14:29:24 (UTC-08:00)");
+        assert!(super::screenshot_taken("/no/such/file.png").is_none());
+    }
+
+    fn empty(container: &str, line: &str, size: &str, kind: &str) -> EmptyBox {
+        EmptyBox {
+            container: container.into(),
+            line: line.into(),
+            size: size.into(),
+            kind: kind.into(),
+        }
+    }
+
+    #[test]
+    fn upsert_adds_to_hand_list_then_updates_everywhere() {
+        let mut uploads = vec![Upload {
+            id: 1,
+            date: "2026-11-13".into(),
+            uploaded_at: "t".into(),
+            source: "list.csv".into(),
+            boxes: vec![empty("MSCU1234567", "MSC", "40", "HC")],
+        }];
+        let mut next = 2;
+        assert!(upsert_box(&mut uploads, "2026-11-13", empty("ZIMU7654321", "ZIM", "20", "DV"), &mut next, "t2"));
+        assert!(upsert_box(&mut uploads, "2026-11-13", empty("ONEU1111111", "ONE", "45", ""), &mut next, "t3"));
+        assert_eq!(uploads.len(), 2, "one hand-entered list per date");
+        assert_eq!(uploads[1].source, MANUAL_SOURCE);
+        assert_eq!(next, 3);
+
+        // Editing a box from a file updates it in place, no duplicate.
+        assert!(!upsert_box(&mut uploads, "2026-11-13", empty("MSCU1234567", "MSC", "20", "DV"), &mut next, "t4"));
+        let day = boxes_for_day(&uploads, "2026-11-13");
+        assert_eq!(day.len(), 3);
+        assert_eq!(day[0].size, "20");
+    }
+
+    #[test]
+    fn remove_drops_box_and_empty_lists() {
+        let mut uploads = Vec::new();
+        let mut next = 1;
+        upsert_box(&mut uploads, "2026-11-13", empty("ZIMU7654321", "ZIM", "20", "DV"), &mut next, "t");
+        upsert_box(&mut uploads, "2026-11-14", empty("ZIMU7654321", "ZIM", "20", "DV"), &mut next, "t");
+        assert_eq!(remove_box(&mut uploads, "2026-11-13", "ZIMU7654321"), 1);
+        assert_eq!(uploads.len(), 1, "other dates are untouched");
+        assert_eq!(uploads[0].date, "2026-11-14");
+    }
+
     use super::*;
 
     #[test]
@@ -685,6 +940,29 @@ mod tests {
             );
         }
         assert_eq!(terminal("its").unwrap().account(), "emodal");
+        for terminal in terminals() {
+            for p in terminal.portals() {
+                assert!(ACCOUNTS.iter().any(|(id, _)| *id == p.account), "{}", p.id);
+                if p.id != EMODAL {
+                    assert_eq!(portal(p.id).unwrap().0.id, terminal.id);
+                }
+            }
+        }
+        let yti: Vec<&str> = terminal("yti").unwrap().portals().iter().map(|p| p.name).collect();
+        assert_eq!(yti, vec!["Gate Link", "LYNX"]);
+        let its: Vec<&str> = terminal("its").unwrap().portals().iter().map(|p| p.id).collect();
+        assert_eq!(its, vec!["its_tms", EMODAL]);
+        // One eModal browser for every terminal that books there.
+        let shared: Vec<&str> = emodal_terminals().iter().map(|t| t.id).collect();
+        for id in ["ets", "its", "pct", "piera", "tti", "trapac"] {
+            assert!(shared.contains(&id), "{id} should use the eModal browser");
+        }
+        for id in ["apm", "lbct", "fenix", "wbct", "yti"] {
+            assert!(!shared.contains(&id), "{id} has its own site");
+        }
+        assert!(browser_name(EMODAL).starts_with("eModal (") && browser_name(EMODAL).contains("TTI"));
+        assert_eq!(portal("etslink").unwrap().0.id, "ets");
+        assert_eq!(portal("apm").unwrap().1.name, "TERMPoint");
         assert_eq!(account_name("termpoint"), "TERMPoint");
     }
 
